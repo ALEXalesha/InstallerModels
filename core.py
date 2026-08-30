@@ -62,12 +62,22 @@ def hf_url(repo, path):
     return f"https://huggingface.co/{repo}/resolve/main/{quote(path)}"
 
 
+def part_path(dest):
+    return Path(dest).with_name(Path(dest).name + ".part")
+
+
 def status(entry, root):
+    """Недокачанный кусок лежит в .part, а не под настоящим именем: fetch()
+    переименовывает файл только целиком. Пока сюда смотрел один dest, оборванная
+    закачка числилась как "ничего нет", хотя на диске уже были гигабайты."""
     dest = Path(root) / entry["dest"]
-    if not dest.exists():
-        return "missing", 0
-    actual = dest.stat().st_size
-    return ("ok" if actual == entry["size"] else "damaged"), actual
+    if dest.exists():
+        actual = dest.stat().st_size
+        return ("ok" if actual == entry["size"] else "damaged"), actual
+    part = part_path(dest)
+    if part.exists():
+        return "partial", part.stat().st_size
+    return "missing", 0
 
 
 def group_size(group):
@@ -99,10 +109,6 @@ def pending(manifest, keys, root):
             if status(entry, root)[0] != "ok":
                 queue.append(entry)
     return queue
-
-
-def part_path(dest):
-    return Path(dest).with_name(Path(dest).name + ".part")
 
 
 def needed_bytes(queue, root):
@@ -148,24 +154,28 @@ def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None)
     dest.parent.mkdir(parents=True, exist_ok=True)
     note = on_note or (lambda text: None)
 
-    if part.exists() and part.stat().st_size > expected:
-        part.unlink()
-
     last_error = None
+    from_scratch = False
     try:
         for attempt in range(1, RETRIES + 1):
             if should_stop and should_stop():
                 raise Cancelled
 
-            offset = part.stat().st_size if part.exists() else 0
+            # Кусок больше ожидаемого, или сервер отказался отдавать остаток -
+            # докачать его нельзя. Стереть прямо тут тоже нельзя: если размер в
+            # манифесте врёт, файл на диске как раз целый, и терять его не за что.
+            # Обрежет его режим "wb" ниже - уже после того, как сервер назовёт
+            # свой размер и станет ясно, что кусок и правда лишний.
+            have = part.stat().st_size if part.exists() else 0
+            offset = 0 if from_scratch or have > expected else have
             if offset == expected:
                 break
 
             try:
                 resp, resumed = open_stream(url, offset)
             except urllib.error.HTTPError as err:
-                if err.code == 416 and part.exists():
-                    part.unlink()
+                if err.code == 416:
+                    from_scratch = True
                     continue
                 if 400 <= err.code < 500:
                     raise RuntimeError(

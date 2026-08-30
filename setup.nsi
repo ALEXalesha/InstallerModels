@@ -1,10 +1,10 @@
 ﻿; Установщик InstallerModels. Ставит для текущего пользователя, без прав администратора.
-; Собирается из build.py, вручную: makensis /DVERSION=1.0.1 setup.nsi
+; Собирается из build.py, вручную: makensis /DVERSION=1.0.2 setup.nsi
 
 Unicode true
 
 !ifndef VERSION
-  !define VERSION "1.0.1"
+  !define VERSION "1.0.2"
 !endif
 
 !define APP     "InstallerModels"
@@ -69,6 +69,12 @@ FunctionEnd
 Section "Программа" SecMain
   SectionIn RO
   Call CheckNotRunning
+
+  ; Ставим поверх старой версии. File перезапишет только одноимённые файлы,
+  ; а в _internal у PyInstaller имена библиотек меняются от сборки к сборке:
+  ; чужие остатки оттуда роняют запуск. Сносим папку целиком.
+  RMDir /r "$INSTDIR\_internal"
+
   SetOutPath "$INSTDIR"
   File /r "dist\app\${APP}\*.*"
 

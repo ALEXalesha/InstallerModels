@@ -4,7 +4,6 @@
 import argparse
 import shutil
 import sys
-import time
 
 from core import (
     Cancelled,
@@ -24,6 +23,8 @@ from core import (
 INTERACTIVE = bool(sys.stdout) and sys.stdout.isatty()
 
 STATE_WORD = {"installed": "installed", "partial": "partial", "missing": "not installed"}
+
+MARK_WORD = {"ok": "ok", "missing": "missing", "partial": "partial", "damaged": "DAMAGED"}
 
 
 class Progress:
@@ -59,8 +60,9 @@ def cmd_list(manifest, root):
     print(f"ComfyUI root: {root}\n")
     for key, group in manifest["groups"].items():
         state = STATE_WORD[group_state(group, root)]
+        count = len(group["files"])
         print(f"  {key:<11} {human(group_size(group)):>10}  {group['title']}")
-        print(f"  {'':<11} {'':>10}  {len(group['files'])} files, {state}")
+        print(f"  {'':<11} {'':>10}  {count} file{'' if count == 1 else 's'}, {state}")
     grand = sum(group_size(g) for g in manifest["groups"].values())
     print(f"\n  everything: {human(grand)}")
 
@@ -71,13 +73,13 @@ def cmd_check(manifest, root):
         print(f"\n{key} - {group['title']}")
         for entry in group["files"]:
             state, actual = status(entry, root)
-            if state == "ok":
-                print(f"  ok        {entry['dest']}")
-            elif state == "missing":
-                print(f"  missing   {entry['dest']}")
-                bad += 1
-            else:
-                print(f"  DAMAGED   {entry['dest']}  ({actual} vs {entry['size']})")
+            tail = ""
+            if state == "partial":
+                tail = f"  ({human(actual)} of {human(entry['size'])} in .part)"
+            elif state == "damaged":
+                tail = f"  ({actual} vs {entry['size']})"
+            print(f"  {MARK_WORD[state]:<9} {entry['dest']}{tail}")
+            if state != "ok":
                 bad += 1
     print(f"\n{bad} file(s) need downloading" if bad else "\nall files present and correct")
     return 1 if bad else 0
@@ -123,7 +125,11 @@ def cmd_install(manifest, root, keys, dry_run):
     need = needed_bytes(queue, root)
     if need < total:
         print(f"already in .part: {human(total - need)}, left to fetch: {human(need)}")
-    free = shutil.disk_usage(root).free
+    try:
+        free = shutil.disk_usage(root).free
+    except OSError as err:
+        print(f"cannot read free space on {root}: {err}")
+        return 1
     if free < need:
         print(f"not enough free space: {human(free)} available, {human(need)} needed")
         return 1

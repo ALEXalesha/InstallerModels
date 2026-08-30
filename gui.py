@@ -149,9 +149,13 @@ class App(ttk.Frame):
 
         picks = ttk.Frame(page)
         picks.grid(row=2, column=0, sticky="we", pady=8)
-        ttk.Button(picks, text="Выделить всё", command=lambda: self.select(True)).pack(side="left")
-        ttk.Button(picks, text="Снять всё", command=lambda: self.select(False)).pack(side="left", padx=6)
-        ttk.Button(picks, text="Только недостающие", command=self.select_missing).pack(side="left")
+        self.pick_buttons = [
+            ttk.Button(picks, text="Выделить всё", command=lambda: self.select(True)),
+            ttk.Button(picks, text="Снять всё", command=lambda: self.select(False)),
+            ttk.Button(picks, text="Только недостающие", command=self.select_missing),
+        ]
+        for button in self.pick_buttons:
+            button.pack(side="left", padx=(0, 6))
         self.picked_label = ttk.Label(picks, font=("", 9, "bold"))
         self.picked_label.pack(side="right")
 
@@ -223,10 +227,17 @@ class App(ttk.Frame):
     # --- действия ---
 
     def lock_controls(self, running):
-        """Пока качаем, папку менять нельзя: поток пишет в ту, что была на старте."""
+        """Пока качаем, папку менять нельзя: поток пишет в ту, что была на старте.
+
+        Кнопки выбора запираются вместе с галочками. Заперты были только галочки,
+        и «Выделить всё» посреди закачки меняло отметки в обход замка: очередь
+        в потоке от этого не менялась, а окно показывало уже другой набор.
+        """
         state = "disabled" if running else "normal"
         self.root_entry.configure(state=state)
         self.browse_button.configure(state=state)
+        for button in self.pick_buttons:
+            button.configure(state=state)
         for row in self.rows.values():
             row.box.configure(state=state)
 

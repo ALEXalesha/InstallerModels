@@ -55,6 +55,13 @@ def find_nsis():
     return Path(found) if found else None
 
 
+def check_nsi_encoding():
+    """Без BOM makensis читает файл как ANSI и молча портит всю кириллицу,
+    включая заголовок окна, по которому установщик ищет запущенную программу."""
+    if not (HERE / "setup.nsi").read_bytes().startswith(b"\xef\xbb\xbf"):
+        sys.exit("setup.nsi должен быть в UTF-8 с BOM, иначе кириллица испортится")
+
+
 def folder_size(path):
     return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
 
@@ -73,6 +80,7 @@ def main():
     shutil.copy2(HERE / "models.json", payload / APP / "models.json")
     shutil.copy2(HERE / "README.md", payload / APP / "README.md")
 
+    check_nsi_encoding()
     nsis = find_nsis()
     if nsis:
         run([str(nsis), f"/DVERSION={VERSION}", str(HERE / "setup.nsi")], "NSIS")

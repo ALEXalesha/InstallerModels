@@ -18,6 +18,14 @@ class Cancelled(Exception):
     """Raised when the user stops a download in progress."""
 
 
+def wait_before_retry(seconds, should_stop):
+    """Sleep in short steps so Cancel does not have to wait out the whole pause."""
+    for _ in range(seconds * 10):
+        if should_stop and should_stop():
+            raise Cancelled
+        time.sleep(0.1)
+
+
 def app_dir():
     return Path(sys.executable).parent if FROZEN else Path(__file__).resolve().parent
 
@@ -123,14 +131,14 @@ def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None)
             if attempt == RETRIES:
                 break
             note(f"server error {err.code}, retry {attempt}/{RETRIES - 1} in 5s")
-            time.sleep(5)
+            wait_before_retry(5, should_stop)
             continue
         except (urllib.error.URLError, OSError) as err:
             last_error = err
             if attempt == RETRIES:
                 break
             note(f"no connection ({err}), retry {attempt}/{RETRIES - 1} in 5s")
-            time.sleep(5)
+            wait_before_retry(5, should_stop)
             continue
 
         if offset and not resumed:
@@ -159,7 +167,7 @@ def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None)
             if attempt == RETRIES:
                 break
             note(f"connection dropped ({err}), resuming in 5s")
-            time.sleep(5)
+            wait_before_retry(5, should_stop)
             continue
 
         size_now = part.stat().st_size

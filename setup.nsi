@@ -1,4 +1,4 @@
-; Установщик InstallerModels. Ставит для текущего пользователя, без прав администратора.
+﻿; Установщик InstallerModels. Ставит для текущего пользователя, без прав администратора.
 ; Собирается из build.py, вручную: makensis /DVERSION=1.0.0 setup.nsi
 
 Unicode true
@@ -43,8 +43,31 @@ VIAddVersionKey "LegalCopyright" "${PUBLISH}"
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "Russian"
 
+; Ищем окно программы по заголовку. Это надёжнее проверки блокировки файла:
+; работает и в деинсталляторе, который запускается копией из %TEMP% и видит
+; другой $INSTDIR. Заголовок должен совпадать с window.title() в gui.py.
+!define WINTITLE "InstallerModels - модели для ComfyUI"
+
+!macro RunningCheck un
+Function ${un}CheckNotRunning
+  again:
+    FindWindow $R0 "" "${WINTITLE}"
+    IntCmp $R0 0 free
+    IfSilent 0 ask
+      Abort "${APP} запущен, закрой программу и повтори."
+    ask:
+    MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "${APP} сейчас запущен. Закрой окно программы и нажми «Повтор»." IDRETRY again
+    Abort "${APP} запущен, операция отменена."
+  free:
+FunctionEnd
+!macroend
+
+!insertmacro RunningCheck ""
+!insertmacro RunningCheck "un."
+
 Section "Программа" SecMain
   SectionIn RO
+  Call CheckNotRunning
   SetOutPath "$INSTDIR"
   File /r "dist\app\${APP}\*.*"
 
@@ -80,6 +103,8 @@ LangString DESC_SecDesktop ${LANG_RUSSIAN} "Положить ярлык на р�
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 Section "Uninstall"
+  Call un.CheckNotRunning
+
   Delete "$DESKTOP\${APP}.lnk"
   Delete "$SMPROGRAMS\${APP}\${APP}.lnk"
   Delete "$SMPROGRAMS\${APP}\Удалить ${APP}.lnk"

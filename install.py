@@ -19,7 +19,7 @@ from core import (
     status,
 )
 
-INTERACTIVE = sys.stdout.isatty()
+INTERACTIVE = bool(sys.stdout) and sys.stdout.isatty()
 
 STATE_WORD = {"installed": "installed", "partial": "partial", "missing": "not installed"}
 

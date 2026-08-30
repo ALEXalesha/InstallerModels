@@ -19,6 +19,7 @@ from core import (
     hf_url,
     human,
     load_manifest,
+    manifest_path,
     pending,
     status,
 )
@@ -30,6 +31,16 @@ def size_ru(nbytes):
     text = human(nbytes)
     number, unit = text.rsplit(" ", 1)
     return f"{number} {UNITS_RU[unit]}"
+
+
+def eta_text(seconds):
+    if seconds > 48 * 3600:
+        return "больше двух суток"
+    hours, rest = divmod(int(seconds), 3600)
+    minutes = rest // 60
+    if hours:
+        return f"{hours} ч {minutes} мин"
+    return f"{minutes} мин" if minutes else "меньше минуты"
 
 
 STATE_LABEL = {
@@ -310,41 +321,52 @@ class App(ttk.Frame):
         self.log("отмена, дожидаюсь текущего куска")
 
     def run_job(self, job, root, total):
-        """Работает в отдельном потоке. Общается с окном только через очередь."""
+        """Работает в отдельном потоке. Общается с окном только через очередь.
+
+        Событие done уходит через finally: без этого любая неожиданная ошибка
+        оставила бы окно с заблокированной кнопкой и без единого объяснения.
+        """
         put = self.events.put
         finished_bytes = 0
         failed = []
+        cancelled = False
 
-        for n, entry in enumerate(job, 1):
-            put(("file", f"[{n}/{len(job)}] {entry['dest']}  ({size_ru(entry['size'])})"))
-            put(("log", f"качаю {entry['dest']} из {entry['repo']}"))
+        try:
+            for n, entry in enumerate(job, 1):
+                put(("file", f"[{n}/{len(job)}] {entry['dest']}  ({size_ru(entry['size'])})"))
+                put(("log", f"качаю {entry['dest']} из {entry['repo']}"))
 
-            def on_progress(done, size, speed, base=finished_bytes):
-                put(("progress", (done, size, base + done, total, speed)))
+                def on_progress(done, size, speed, base=finished_bytes):
+                    put(("progress", (done, size, base + done, total, speed)))
 
-            try:
-                fetch(
-                    hf_url(entry["repo"], entry["path"]),
-                    root / entry["dest"],
-                    entry["size"],
-                    on_progress=on_progress,
-                    on_note=lambda text: put(("log", f"  {text}")),
-                    should_stop=self.stop_flag.is_set,
-                )
-            except Cancelled:
-                put(("log", "остановлено, недокачанный кусок сохранён для докачки"))
-                put(("done", (failed, True)))
-                return
-            except Exception as err:
-                put(("log", f"ОШИБКА {entry['dest']}: {err}"))
-                failed.append(entry["dest"])
-            else:
-                put(("log", f"готово {entry['dest']}"))
+                try:
+                    fetch(
+                        hf_url(entry["repo"], entry["path"]),
+                        root / entry["dest"],
+                        entry["size"],
+                        on_progress=on_progress,
+                        on_note=lambda text: put(("log", f"  {text}")),
+                        should_stop=self.stop_flag.is_set,
+                    )
+                except Cancelled:
+                    put(("log", "остановлено, недокачанный кусок сохранён для докачки"))
+                    cancelled = True
+                    return
+                except Exception as err:
+                    put(("log", f"ОШИБКА {entry['dest']}: {err}"))
+                    failed.append(entry["dest"])
+                else:
+                    put(("log", f"готово {entry['dest']}"))
 
-            finished_bytes += entry["size"]
-            put(("progress", (entry["size"], entry["size"], finished_bytes, total, 0)))
-
-        put(("done", (failed, False)))
+                finished_bytes += entry["size"]
+                put(("progress", (entry["size"], entry["size"], finished_bytes, total, 0)))
+        except Cancelled:
+            cancelled = True
+        except Exception as err:
+            put(("log", f"СБОЙ ПРОГРАММЫ: {type(err).__name__}: {err}"))
+            failed.append("внутренняя ошибка, смотри лог")
+        finally:
+            put(("done", (failed, cancelled)))
 
     def drain_events(self):
         try:
@@ -359,10 +381,9 @@ class App(ttk.Frame):
                     self.file_bar.configure(value=done * 1000 / size if size else 0)
                     self.total_bar.configure(value=overall * 1000 / total if total else 0)
                     if speed > 0:
-                        eta = (total - overall) / speed
                         self.speed_label.configure(
                             text=f"{size_ru(speed)}/с   осталось всего примерно "
-                                 f"{int(eta // 3600)} ч {int(eta % 3600 // 60)} мин"
+                                 f"{eta_text((total - overall) / speed)}"
                         )
                 elif kind == "done":
                     self.finish_job(*payload)
@@ -407,6 +428,8 @@ class App(ttk.Frame):
 def main():
     enable_dpi_awareness()
     window = tk.Tk()
+    # Заголовок ищет установщик через FindWindow, чтобы не сносить запущенную
+    # программу. Меняешь тут - поменяй WINTITLE в setup.nsi.
     window.title("InstallerModels - модели для ComfyUI")
     window.geometry("880x720")
     window.minsize(720, 560)
@@ -418,10 +441,22 @@ def main():
             except Exception:
                 pass
             break
-    app = App(window)
+    try:
+        app = App(window)
+    except Exception as err:
+        window.withdraw()
+        messagebox.showerror(
+            "Не удалось прочитать список моделей",
+            f"Файл models.json не читается:\n\n{type(err).__name__}: {err}\n\n"
+            f"Ожидается тут:\n{manifest_path()}",
+        )
+        window.destroy()
+        return 1
+
     window.protocol("WM_DELETE_WINDOW", app.on_close)
     window.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

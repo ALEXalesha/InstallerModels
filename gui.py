@@ -34,6 +34,7 @@ def size_ru(nbytes):
 
 
 def eta_text(seconds):
+    seconds = max(0, seconds)
     if seconds > 48 * 3600:
         return "больше двух суток"
     hours, rest = divmod(int(seconds), 3600)
@@ -130,8 +131,10 @@ class App(ttk.Frame):
         top.grid(row=0, column=0, sticky="we", pady=(0, 8))
         top.columnconfigure(1, weight=1)
         ttk.Label(top, text="Папка ComfyUI:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.root_path).grid(row=0, column=1, sticky="we", padx=6)
-        ttk.Button(top, text="Обзор", command=self.pick_folder, width=10).grid(row=0, column=2)
+        self.root_entry = ttk.Entry(top, textvariable=self.root_path)
+        self.root_entry.grid(row=0, column=1, sticky="we", padx=6)
+        self.browse_button = ttk.Button(top, text="Обзор", command=self.pick_folder, width=10)
+        self.browse_button.grid(row=0, column=2)
         self.disk_label = ttk.Label(top, foreground="#555555")
         self.disk_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
@@ -217,6 +220,14 @@ class App(ttk.Frame):
             ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
     # --- действия ---
+
+    def lock_controls(self, running):
+        """Пока качаем, папку менять нельзя: поток пишет в ту, что была на старте."""
+        state = "disabled" if running else "normal"
+        self.root_entry.configure(state=state)
+        self.browse_button.configure(state=state)
+        for row in self.rows.values():
+            row.box.configure(state=state)
 
     def copy(self, text):
         self.clipboard_clear()
@@ -307,6 +318,7 @@ class App(ttk.Frame):
             return
 
         self.stop_flag.clear()
+        self.lock_controls(True)
         self.download_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
         self.total_bar.configure(value=0)
@@ -368,31 +380,49 @@ class App(ttk.Frame):
         finally:
             put(("done", (failed, cancelled)))
 
+    def apply_event(self, kind, payload):
+        if kind == "log":
+            self.log(payload)
+        elif kind == "file":
+            self.file_label.configure(text=payload)
+        elif kind == "progress":
+            done, size, overall, total, speed = payload
+            self.file_bar.configure(value=done * 1000 / size if size else 0)
+            self.total_bar.configure(value=overall * 1000 / total if total else 0)
+            if speed > 0:
+                self.speed_label.configure(
+                    text=f"{size_ru(speed)}/с   осталось всего примерно "
+                         f"{eta_text((total - overall) / speed)}"
+                )
+            else:
+                self.speed_label.configure(text="")
+        elif kind == "done":
+            self.finish_job(*payload)
+
     def drain_events(self):
+        """Насос событий обязан пережить что угодно: пока он крутится, окно живо.
+
+        Раньше исключение в любом обработчике уносило и перепланирование - окно
+        оставалось с заблокированной кнопкой и замершими полосками навсегда.
+        """
         try:
             while True:
                 kind, payload = self.events.get_nowait()
-                if kind == "log":
-                    self.log(payload)
-                elif kind == "file":
-                    self.file_label.configure(text=payload)
-                elif kind == "progress":
-                    done, size, overall, total, speed = payload
-                    self.file_bar.configure(value=done * 1000 / size if size else 0)
-                    self.total_bar.configure(value=overall * 1000 / total if total else 0)
-                    if speed > 0:
-                        self.speed_label.configure(
-                            text=f"{size_ru(speed)}/с   осталось всего примерно "
-                                 f"{eta_text((total - overall) / speed)}"
-                        )
-                elif kind == "done":
-                    self.finish_job(*payload)
+                try:
+                    self.apply_event(kind, payload)
+                except Exception as err:
+                    print(f"сбой обработчика {kind}: {type(err).__name__}: {err}",
+                          file=sys.stderr)
         except queue.Empty:
             pass
-        if not self.closing:
-            self.after(100, self.drain_events)
+        except Exception as err:
+            print(f"сбой насоса событий: {type(err).__name__}: {err}", file=sys.stderr)
+        finally:
+            if not self.closing:
+                self.after(100, self.drain_events)
 
     def finish_job(self, failed, cancelled):
+        self.lock_controls(False)
         self.download_button.configure(state="normal")
         self.cancel_button.configure(state="disabled")
         self.speed_label.configure(text="")

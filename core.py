@@ -1,5 +1,6 @@
 """Shared logic for the CLI and the GUI: manifest, sizes, resumable download."""
 
+import http.client
 import json
 import os
 import sys
@@ -80,13 +81,27 @@ def group_state(group, root):
     return "partial" if any(m == "ok" for m in marks) else "missing"
 
 
+def unique(keys):
+    """Порядок сохраняем, повторы убираем: install.py ltx ltx - это одна группа."""
+    return list(dict.fromkeys(keys))
+
+
 def pending(manifest, keys, root):
-    queue = []
-    for key in keys:
+    queue, seen = [], set()
+    for key in unique(keys):
         for entry in manifest["groups"][key]["files"]:
+            if entry["dest"] in seen:
+                continue
+            seen.add(entry["dest"])
             if status(entry, root)[0] != "ok":
                 queue.append(entry)
     return queue
+
+
+# http.client.IncompleteRead и родня не наследуются от OSError, а на chunked
+# ответах Hugging Face они прилетают вместо разрыва сокета. Без них один сбой
+# сети ронял весь файл мимо всей логики повторов.
+NETWORK_ERRORS = (urllib.error.URLError, http.client.HTTPException, OSError)
 
 
 def open_stream(url, offset):
@@ -95,6 +110,16 @@ def open_stream(url, offset):
         req.add_header("Range", f"bytes={offset}-")
     resp = urllib.request.urlopen(req, timeout=60)
     return resp, resp.getcode() == 206
+
+
+def server_size(resp, resumed):
+    """Полный размер файла на сервере, или None если сервер его не назвал."""
+    if resumed:
+        chunk = resp.headers.get("Content-Range", "").rsplit("/", 1)
+        tail = chunk[-1].strip() if len(chunk) == 2 else ""
+    else:
+        tail = (resp.headers.get("Content-Length") or "").strip()
+    return int(tail) if tail.isdigit() else None
 
 
 def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None):
@@ -133,13 +158,21 @@ def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None)
             note(f"server error {err.code}, retry {attempt}/{RETRIES - 1} in 5s")
             wait_before_retry(5, should_stop)
             continue
-        except (urllib.error.URLError, OSError) as err:
+        except NETWORK_ERRORS as err:
             last_error = err
             if attempt == RETRIES:
                 break
             note(f"no connection ({err}), retry {attempt}/{RETRIES - 1} in 5s")
             wait_before_retry(5, should_stop)
             continue
+
+        remote = server_size(resp, resumed)
+        if remote is not None and remote != expected:
+            resp.close()
+            raise RuntimeError(
+                f"server has {human(remote)}, models.json says {human(expected)} - "
+                f"the manifest is out of date, fix size for this file"
+            )
 
         if offset and not resumed:
             offset = 0
@@ -162,7 +195,7 @@ def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None)
                         on_progress(done, expected, (done - offset) / elapsed)
         except Cancelled:
             raise
-        except (urllib.error.URLError, OSError) as err:
+        except NETWORK_ERRORS as err:
             last_error = err
             if attempt == RETRIES:
                 break
@@ -176,6 +209,10 @@ def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None)
         if size_now == offset:
             note("server sent nothing new, starting this file over")
             part.unlink()
+        elif attempt < RETRIES:
+            last_error = f"stream ended at {human(size_now)} of {human(expected)}"
+            note(f"stream ended early at {human(size_now)}, resuming in 5s")
+            wait_before_retry(5, should_stop)
 
     actual = part.stat().st_size if part.exists() else 0
     if actual != expected:

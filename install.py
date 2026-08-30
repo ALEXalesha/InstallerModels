@@ -17,6 +17,7 @@ from core import (
     load_manifest,
     pending,
     status,
+    unique,
 )
 
 INTERACTIVE = bool(sys.stdout) and sys.stdout.isatty()
@@ -95,11 +96,16 @@ def cmd_lmstudio(manifest):
 
 def cmd_install(manifest, root, keys, dry_run):
     queue = pending(manifest, keys, root)
-    wanted = {id(e) for e in queue}
-    for key in keys:
+    wanted = {e["dest"] for e in queue}
+    shown = set()
+    for key in unique(keys):
         for entry in manifest["groups"][key]["files"]:
-            if id(entry) not in wanted:
-                print(f"skip (already there)  {entry['dest']}")
+            dest = entry["dest"]
+            if dest in shown:
+                continue
+            shown.add(dest)
+            if dest not in wanted:
+                print(f"skip (already there)  {dest}")
 
     if not queue:
         print("\nnothing to download")
@@ -188,7 +194,7 @@ def main():
     if args.check:
         return cmd_check(manifest, root)
 
-    keys = groups if args.all else args.groups
+    keys = groups if args.all else unique(args.groups)
     unknown = [k for k in keys if k not in manifest["groups"]]
     if unknown:
         print(f"unknown group(s): {', '.join(unknown)}")

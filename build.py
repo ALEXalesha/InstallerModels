@@ -12,7 +12,7 @@ HERE = Path(__file__).resolve().parent
 DIST = HERE / "dist"
 WORK = HERE / "build"
 APP = "InstallerModels"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 TITLE_IN_GUI = r'window\.title\("([^"]*)"\)'
 TITLE_IN_NSI = r'!define WINTITLE "([^"]*)"'
@@ -84,6 +84,20 @@ def check_window_title():
         )
 
 
+def check_fields(where, entry, fields):
+    """Кавычки внутри f-строки намеренно не вкладываются: так файл читается и
+    Python 3.8, который в доках обещан как нижняя граница. Вложенные заработали
+    только с 3.12, и на 3.11 сборка падала не с понятной ошибкой, а SyntaxError
+    ещё до первой строчки работы."""
+    missing = [f for f in fields if f not in entry]
+    if missing:
+        sys.exit(f"{where}: нет полей " + ", ".join(missing))
+    if "size" in fields:
+        size = entry["size"]
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            sys.exit(f"{where}: size должен быть целым числом байт, а там {size!r}")
+
+
 def check_manifest():
     """models.json уезжает внутрь exe. Битый или неполный - программа откроется
     и сразу покажет ошибку, а узнаем мы об этом уже после сборки."""
@@ -94,11 +108,19 @@ def check_manifest():
     for key in ("comfyui_root", "groups", "lmstudio"):
         if key not in manifest:
             sys.exit(f"в models.json нет ключа {key}")
+
     for name, group in manifest["groups"].items():
+        check_fields(f"группа {name}", group, ("title", "title_ru", "files"))
         for entry in group["files"]:
-            missing = [f for f in ("repo", "path", "dest", "size") if f not in entry]
-            if missing:
-                sys.exit(f"в группе {name} у файла нет полей: {", ".join(missing)}")
+            check_fields(f"группа {name}, файл {entry.get('dest', '?')}",
+                         entry, ("repo", "path", "dest", "size"))
+
+    # Вкладку LM Studio окно строит из этих же полей, а проверял их до сих пор
+    # никто: опечатка ловилась уже запущенным exe, то есть после всей сборки.
+    for model in manifest["lmstudio"]:
+        check_fields("раздел lmstudio", model, ("search", "quant", "files"))
+        for item in model["files"]:
+            check_fields(f"lmstudio {model['search']}", item, ("name", "size"))
 
 
 def preflight():

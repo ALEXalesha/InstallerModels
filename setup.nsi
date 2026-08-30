@@ -1,10 +1,10 @@
 ﻿; Установщик InstallerModels. Ставит для текущего пользователя, без прав администратора.
-; Собирается из build.py, вручную: makensis /DVERSION=1.0.0 setup.nsi
+; Собирается из build.py, вручную: makensis /DVERSION=1.0.1 setup.nsi
 
 Unicode true
 
 !ifndef VERSION
-  !define VERSION "1.0.0"
+  !define VERSION "1.0.1"
 !endif
 
 !define APP     "InstallerModels"

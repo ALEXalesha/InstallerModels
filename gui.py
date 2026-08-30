@@ -20,6 +20,7 @@ from core import (
     human,
     load_manifest,
     manifest_path,
+    needed_bytes,
     pending,
     status,
 )
@@ -241,7 +242,9 @@ class App(ttk.Frame):
             self.refresh()
 
     def current_root(self):
-        return Path(self.root_path.get())
+        # expanduser здесь не для красоты: comfy_root() его делает, и без него
+        # набранное руками "~/ComfyUI" превращалось в "папка не найдена".
+        return Path(self.root_path.get()).expanduser()
 
     def select(self, value):
         for row in self.rows.values():
@@ -275,8 +278,17 @@ class App(ttk.Frame):
             self.picked_label.configure(text="")
             return
 
-        free = shutil.disk_usage(root).free
-        self.disk_label.configure(text=f"свободно на диске: {size_ru(free)}", foreground="#555555")
+        # Папка может существовать и всё равно не отвечать: отключённый сетевой
+        # диск, вынутая флешка. Раньше это исключение вылетало из __init__, и окно
+        # показывало "models.json не читается" - диагноз мимо цели.
+        try:
+            free = shutil.disk_usage(root).free
+        except OSError as err:
+            self.disk_label.configure(text=f"диск не отвечает: {err}", foreground="#c0392b")
+        else:
+            self.disk_label.configure(
+                text=f"свободно на диске: {size_ru(free)}", foreground="#555555"
+            )
         for row in self.rows.values():
             row.refresh(root)
         self.update_selection()
@@ -303,17 +315,27 @@ class App(ttk.Frame):
             return
 
         total = sum(e["size"] for e in job)
-        free = shutil.disk_usage(root).free
-        if free < total:
+        need = needed_bytes(job, root)
+        try:
+            free = shutil.disk_usage(root).free
+        except OSError as err:
+            messagebox.showerror("Диск не отвечает", f"Не могу узнать свободное место:\n{err}")
+            return
+        if free < need:
             messagebox.showerror(
                 "Мало места",
-                f"Нужно {size_ru(total)}, свободно только {size_ru(free)}.",
+                f"Нужно {size_ru(need)}, свободно только {size_ru(free)}.",
             )
             return
 
+        # Показываем и полный объём группы, и остаток: иначе после обрыва
+        # окно пугает сорока гигабайтами там, где качать осталось два.
+        volume = size_ru(total)
+        if need < total:
+            volume += f" (из них уже лежит {size_ru(total - need)})"
         if not messagebox.askyesno(
             "Начать скачивание",
-            f"Файлов: {len(job)}\nОбъём: {size_ru(total)}\n\nПапка: {root}\n\nНачинаем?",
+            f"Файлов: {len(job)}\nОбъём: {volume}\n\nПапка: {root}\n\nНачинаем?",
         ):
             return
 

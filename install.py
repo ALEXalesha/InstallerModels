@@ -15,6 +15,7 @@ from core import (
     hf_url,
     human,
     load_manifest,
+    needed_bytes,
     pending,
     status,
     unique,
@@ -119,9 +120,12 @@ def cmd_install(manifest, root, keys, dry_run):
             print(f"    -> {entry['dest']}  ({human(entry['size'])})")
         return 0
 
+    need = needed_bytes(queue, root)
+    if need < total:
+        print(f"already in .part: {human(total - need)}, left to fetch: {human(need)}")
     free = shutil.disk_usage(root).free
-    if free < total:
-        print(f"not enough free space: {human(free)} available, {human(total)} needed")
+    if free < need:
+        print(f"not enough free space: {human(free)} available, {human(need)} needed")
         return 1
 
     failed = []

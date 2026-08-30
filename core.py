@@ -75,10 +75,13 @@ def group_size(group):
 
 
 def group_state(group, root):
+    """Битый файл - это тоже "что-то уже лежит". Раньше группа с единственным
+    недокачанным файлом показывалась как "не установлено", хотя место он занимал
+    и докачивать его предстояло, а не качать с нуля."""
     marks = [status(f, root)[0] for f in group["files"]]
-    if all(m == "ok" for m in marks):
+    if marks and all(m == "ok" for m in marks):
         return "installed"
-    return "partial" if any(m == "ok" for m in marks) else "missing"
+    return "partial" if any(m != "missing" for m in marks) else "missing"
 
 
 def unique(keys):
@@ -96,6 +99,22 @@ def pending(manifest, keys, root):
             if status(entry, root)[0] != "ok":
                 queue.append(entry)
     return queue
+
+
+def part_path(dest):
+    return Path(dest).with_name(Path(dest).name + ".part")
+
+
+def needed_bytes(queue, root):
+    """Сколько ещё предстоит скачать. Недокачанные .part уже лежат на диске и
+    места заново не просят: без этого прерванная на середине группа на 40 ГБ
+    отказывалась продолжаться, пока не освободишь все 40 ГБ ещё раз."""
+    total = 0
+    for entry in queue:
+        part = part_path(Path(root) / entry["dest"])
+        have = part.stat().st_size if part.exists() else 0
+        total += max(entry["size"] - have, 0)
+    return total
 
 
 # http.client.IncompleteRead и родня не наследуются от OSError, а на chunked
@@ -125,7 +144,7 @@ def server_size(resp, resumed):
 def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None):
     """Download one file, resuming a leftover .part if there is one."""
     dest = Path(dest)
-    part = dest.with_name(dest.name + ".part")
+    part = part_path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     note = on_note or (lambda text: None)
 
@@ -133,86 +152,103 @@ def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None)
         part.unlink()
 
     last_error = None
-    for attempt in range(1, RETRIES + 1):
-        if should_stop and should_stop():
-            raise Cancelled
+    try:
+        for attempt in range(1, RETRIES + 1):
+            if should_stop and should_stop():
+                raise Cancelled
 
-        offset = part.stat().st_size if part.exists() else 0
-        if offset == expected:
-            break
+            offset = part.stat().st_size if part.exists() else 0
+            if offset == expected:
+                break
 
-        try:
-            resp, resumed = open_stream(url, offset)
-        except urllib.error.HTTPError as err:
-            if err.code == 416 and part.exists():
-                part.unlink()
+            try:
+                resp, resumed = open_stream(url, offset)
+            except urllib.error.HTTPError as err:
+                if err.code == 416 and part.exists():
+                    part.unlink()
+                    continue
+                if 400 <= err.code < 500:
+                    raise RuntimeError(
+                        f"HTTP {err.code} from Hugging Face - file moved or renamed, "
+                        f"check repo and path in models.json"
+                    ) from None
+                last_error = err
+                if attempt == RETRIES:
+                    break
+                note(f"server error {err.code}, retry {attempt}/{RETRIES - 1} in 5s")
+                wait_before_retry(5, should_stop)
                 continue
-            if 400 <= err.code < 500:
+            except NETWORK_ERRORS as err:
+                last_error = err
+                if attempt == RETRIES:
+                    break
+                note(f"no connection ({err}), retry {attempt}/{RETRIES - 1} in 5s")
+                wait_before_retry(5, should_stop)
+                continue
+
+            remote = server_size(resp, resumed)
+            # Ноль в Content-Length сервер отдаёт и когда у него самого сбой, так что
+            # о манифесте это не говорит ничего - такой ответ уходит в обычный повтор.
+            # Размер печатаем в байтах: в КиБ 10240 и 10244 выглядят одинаково, а
+            # чинить по этому сообщению предстоит именно точное число.
+            if remote and remote != expected:
+                resp.close()
                 raise RuntimeError(
-                    f"HTTP {err.code} from Hugging Face - file moved or renamed, "
-                    f"check repo and path in models.json"
-                ) from None
-            last_error = err
-            if attempt == RETRIES:
+                    f"server has {remote} bytes, models.json says {expected} - "
+                    f"the manifest is out of date, fix size for this file"
+                )
+
+            if offset and not resumed:
+                offset = 0
+            mode = "ab" if offset else "wb"
+
+            started = time.monotonic()
+            done = offset
+            try:
+                with resp, open(part, mode) as out:
+                    while True:
+                        if should_stop and should_stop():
+                            raise Cancelled
+                        block = resp.read(CHUNK)
+                        if not block:
+                            break
+                        out.write(block)
+                        done += len(block)
+                        if on_progress:
+                            elapsed = max(time.monotonic() - started, 1e-6)
+                            on_progress(done, expected, (done - offset) / elapsed)
+            except Cancelled:
+                raise
+            except NETWORK_ERRORS as err:
+                last_error = err
+                if attempt == RETRIES:
+                    break
+                note(f"connection dropped ({err}), resuming in 5s")
+                wait_before_retry(5, should_stop)
+                continue
+
+            size_now = part.stat().st_size
+            if size_now == expected:
                 break
-            note(f"server error {err.code}, retry {attempt}/{RETRIES - 1} in 5s")
-            wait_before_retry(5, should_stop)
-            continue
-        except NETWORK_ERRORS as err:
-            last_error = err
-            if attempt == RETRIES:
-                break
-            note(f"no connection ({err}), retry {attempt}/{RETRIES - 1} in 5s")
-            wait_before_retry(5, should_stop)
-            continue
-
-        remote = server_size(resp, resumed)
-        if remote is not None and remote != expected:
-            resp.close()
-            raise RuntimeError(
-                f"server has {human(remote)}, models.json says {human(expected)} - "
-                f"the manifest is out of date, fix size for this file"
-            )
-
-        if offset and not resumed:
-            offset = 0
-        mode = "ab" if offset else "wb"
-
-        started = time.monotonic()
-        done = offset
-        try:
-            with resp, open(part, mode) as out:
-                while True:
-                    if should_stop and should_stop():
-                        raise Cancelled
-                    block = resp.read(CHUNK)
-                    if not block:
-                        break
-                    out.write(block)
-                    done += len(block)
-                    if on_progress:
-                        elapsed = max(time.monotonic() - started, 1e-6)
-                        on_progress(done, expected, (done - offset) / elapsed)
-        except Cancelled:
-            raise
-        except NETWORK_ERRORS as err:
-            last_error = err
-            if attempt == RETRIES:
-                break
-            note(f"connection dropped ({err}), resuming in 5s")
-            wait_before_retry(5, should_stop)
-            continue
-
-        size_now = part.stat().st_size
-        if size_now == expected:
-            break
-        if size_now == offset:
-            note("server sent nothing new, starting this file over")
-            part.unlink()
-        elif attempt < RETRIES:
-            last_error = f"stream ended at {human(size_now)} of {human(expected)}"
-            note(f"stream ended early at {human(size_now)}, resuming in 5s")
-            wait_before_retry(5, should_stop)
+            if attempt < RETRIES:
+                # Раньше пустой ответ считался поводом качать файл заново, и .part
+                # стирался. На двадцати гигабайтах это выкидывало часы работы из-за
+                # одного сбойного ответа. Недокачанное теперь не трогаем никогда:
+                # даже если попытки кончатся, следующий запуск продолжит с места.
+                if size_now == offset:
+                    last_error = "server sent no new bytes"
+                    note(f"server sent nothing new, retry {attempt}/{RETRIES - 1} in 5s")
+                else:
+                    last_error = f"stream ended at {human(size_now)} of {human(expected)}"
+                    note(f"stream ended early at {human(size_now)}, resuming in 5s")
+                wait_before_retry(5, should_stop)
+    except Cancelled:
+        # Отмена могла прийти ровно на дописанном последнем куске. Готовый
+        # файл из-за этого терять незачем - доводим его до места и только
+        # потом всплываем наверх.
+        if part.exists() and part.stat().st_size == expected:
+            os.replace(part, dest)
+        raise
 
     actual = part.stat().st_size if part.exists() else 0
     if actual != expected:

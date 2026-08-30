@@ -8,6 +8,7 @@ import sys
 from core import (
     Cancelled,
     comfy_root,
+    dest_path,
     fetch,
     group_size,
     group_state,
@@ -30,8 +31,7 @@ MARK_WORD = {"ok": "ok", "missing": "missing", "partial": "partial", "damaged": 
 class Progress:
     """Redraws one line in a terminal, prints every 10% when piped to a file."""
 
-    def __init__(self, total):
-        self.total = total
+    def __init__(self):
         self.next_step = 0
 
     def update(self, done, total, speed):
@@ -87,7 +87,7 @@ def cmd_check(manifest, root):
 
 def cmd_lmstudio(manifest):
     print("LM Studio models. Paste the name into LM Studio search, or use the lms CLI.\n")
-    for model in manifest["lmstudio"]:
+    for model in manifest.get("lmstudio", []):
         total = sum(f["size"] for f in model["files"])
         print(f"  {model['search']}")
         print(f"    quant to pick: {model['quant']}   total {human(total)}")
@@ -138,16 +138,19 @@ def cmd_install(manifest, root, keys, dry_run):
     for n, entry in enumerate(queue, 1):
         print(f"\n[{n}/{len(queue)}] {entry['dest']}  ({human(entry['size'])})")
         print(f"  from {entry['repo']}/{entry['path']}")
-        bar = Progress(entry["size"])
+        bar = Progress()
         try:
             fetch(
                 hf_url(entry["repo"], entry["path"]),
-                root / entry["dest"],
+                dest_path(root, entry["dest"]),
                 entry["size"],
                 on_progress=bar.update,
                 on_note=lambda text: print(f"\n  {text}"),
             )
-        except Cancelled:
+        # Ctrl+C прилетает прямо посреди строки с полоской прогресса, и
+        # прощальное "interrupted" приклеивалось к ней хвостом. Перевод строки
+        # ставим здесь, пока про полоску ещё есть кому вспомнить.
+        except (Cancelled, KeyboardInterrupt):
             bar.finish()
             raise KeyboardInterrupt
         except Exception as err:
@@ -168,7 +171,13 @@ def cmd_install(manifest, root, keys, dry_run):
 
 
 def main():
-    manifest = load_manifest()
+    # Кривой models.json до сих пор вываливался трассировкой Python на человека,
+    # который его же руками и правил. Ошибку показываем по-человечески.
+    try:
+        manifest = load_manifest()
+    except (OSError, ValueError) as err:
+        print(f"models.json не читается: {err}")
+        return 1
     groups = list(manifest["groups"])
 
     parser = argparse.ArgumentParser(

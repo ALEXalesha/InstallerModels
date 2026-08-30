@@ -13,6 +13,7 @@ from core import (
     Cancelled,
     app_dir,
     comfy_root,
+    dest_path,
     fetch,
     group_size,
     group_state,
@@ -22,6 +23,8 @@ from core import (
     manifest_path,
     needed_bytes,
     pending,
+    remember_root,
+    saved_root,
     status,
 )
 
@@ -96,7 +99,12 @@ class App(ttk.Frame):
         master.rowconfigure(0, weight=1)
 
         self.manifest = load_manifest()
-        self.root_path = tk.StringVar(value=str(comfy_root(self.manifest)))
+        # Папку, выбранную «Обзором», помним между запусками: раньше её
+        # приходилось искать заново каждый раз, а путь из models.json почти
+        # никому не подходил.
+        self.root_path = tk.StringVar(
+            value=saved_root() or str(comfy_root(self.manifest))
+        )
         self.events = queue.Queue()
         self.stop_flag = threading.Event()
         self.worker = None
@@ -250,6 +258,7 @@ class App(ttk.Frame):
         chosen = filedialog.askdirectory(title="Где лежит ComfyUI", initialdir=self.root_path.get())
         if chosen:
             self.root_path.set(chosen)
+            remember_root(chosen)
             self.refresh()
 
     def current_root(self):
@@ -350,6 +359,7 @@ class App(ttk.Frame):
         ):
             return
 
+        remember_root(root)
         self.stop_flag.clear()
         self.lock_controls(True)
         self.download_button.configure(state="disabled")
@@ -387,7 +397,7 @@ class App(ttk.Frame):
                 try:
                     fetch(
                         hf_url(entry["repo"], entry["path"]),
-                        root / entry["dest"],
+                        dest_path(root, entry["dest"]),
                         entry["size"],
                         on_progress=on_progress,
                         on_note=lambda text: put(("log", f"  {text}")),
@@ -396,7 +406,7 @@ class App(ttk.Frame):
                 except Cancelled:
                     put(("log", "остановлено, недокачанный кусок сохранён для докачки"))
                     cancelled = True
-                    return
+                    break
                 except Exception as err:
                     put(("log", f"ОШИБКА {entry['dest']}: {err}"))
                     failed.append(entry["dest"])
@@ -464,6 +474,14 @@ class App(ttk.Frame):
 
         if cancelled:
             self.file_label.configure(text="остановлено")
+            # Отмена перебивала показ уже сломавшихся файлов, и человек уходил
+            # с мыслью, что просто нажал «Отмена», а качать больше нечего.
+            if failed:
+                messagebox.showwarning(
+                    "Часть файлов не скачалась",
+                    "До остановки не удалось скачать:\n\n" + "\n".join(failed) +
+                    "\n\nНажми «Скачать выбранное» ещё раз, докачается с того же места.",
+                )
         elif failed:
             self.file_label.configure(text=f"не скачалось файлов: {len(failed)}")
             messagebox.showwarning(
@@ -484,6 +502,11 @@ class App(ttk.Frame):
             ):
                 return
             self.stop_flag.set()
+            # Даём потоку дописать текущий кусок. Без этого окно закрывалось
+            # мгновенно, поток-демон умирал прямо на write(), и последние
+            # мегабайты буфера пропадали - докачка начиналась чуть раньше,
+            # чем показывала полоска.
+            self.worker.join(timeout=5)
         self.closing = True
         self.master.destroy()
 

@@ -8,11 +8,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+from core import dest_parts
+
 HERE = Path(__file__).resolve().parent
 DIST = HERE / "dist"
 WORK = HERE / "build"
 APP = "InstallerModels"
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 TITLE_IN_GUI = r'window\.title\("([^"]*)"\)'
 TITLE_IN_NSI = r'!define WINTITLE "([^"]*)"'
@@ -98,6 +100,14 @@ def check_version():
         )
 
 
+def check_tests():
+    """Проверки гоняем до сборки, а не после. Ловят они ровно то, что уже
+    ломалось: докачку на рваной связи, кривой dest, разъехавшиеся версии."""
+    done = subprocess.run([sys.executable, str(HERE / "tests.py")], cwd=HERE)
+    if done.returncode:
+        sys.exit("проверки не прошли, сборку не начинаю")
+
+
 def check_pyinstaller():
     """Зовут его уже после того, как dist/ и build/ стёрты. Не найдётся - и от
     прошлой сборки ничего не останется, а новая не появится."""
@@ -140,6 +150,13 @@ def check_manifest():
         for entry in group["files"]:
             check_fields(f"группа {name}, файл {entry.get('dest', '?')}",
                          entry, ("repo", "path", "dest", "size"))
+            # Абсолютный путь или ".." в dest уводят запись мимо папки ComfyUI:
+            # Path(root) / "C:/qwe.bin" - это просто "C:/qwe.bin". Ловим здесь,
+            # чтобы такая опечатка не уехала внутрь собранного exe.
+            try:
+                dest_parts(entry["dest"])
+            except ValueError as err:
+                sys.exit(f"группа {name}: {err}")
             first_group, first_entry = seen.setdefault(entry["dest"], (name, entry))
             if first_entry != entry:
                 sys.exit(f"{entry['dest']}: разные записи в группах {first_group} и {name}")
@@ -155,13 +172,15 @@ def check_manifest():
 def preflight():
     """Все проверки - до сборки. Раньше кодировка setup.nsi проверялась после
     двух прогонов PyInstaller, то есть через пару минут работы впустую."""
-    for name in ("gui.py", "core.py", "models.json", "icon.ico", "setup.nsi", "README.md"):
+    for name in ("gui.py", "core.py", "tests.py", "models.json",
+                 "icon.ico", "setup.nsi", "README.md"):
         if not (HERE / name).exists():
             sys.exit(f"не хватает файла {name}")
     check_manifest()
     check_nsi_encoding()
     check_window_title()
     check_version()
+    check_tests()
     check_pyinstaller()
 
 

@@ -1,10 +1,10 @@
 ﻿; Установщик InstallerModels. Ставит для текущего пользователя, без прав администратора.
-; Собирается из build.py, вручную: makensis /DVERSION=1.0.2 setup.nsi
+; Собирается из build.py, вручную: makensis /DVERSION=1.0.3 setup.nsi
 
 Unicode true
 
 !ifndef VERSION
-  !define VERSION "1.0.2"
+  !define VERSION "1.0.3"
 !endif
 
 !define APP     "InstallerModels"
@@ -75,8 +75,10 @@ Section "Программа" SecMain
   ; чужие остатки оттуда роняют запуск. Сносим папку целиком.
   RMDir /r "$INSTDIR\_internal"
 
+  ; Маска "*.*" пропускает файлы без расширения - у PyInstaller такие
+  ; попадаются среди данных в _internal, и без них программа не стартует.
   SetOutPath "$INSTDIR"
-  File /r "dist\app\${APP}\*.*"
+  File /r "dist\app\${APP}\*"
 
   WriteRegStr HKCU "Software\${APP}" "InstallDir" "$INSTDIR"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
@@ -123,6 +125,11 @@ Section "Uninstall"
   Delete "$INSTDIR\README.md"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
+
+  ; Запомненная папка ComfyUI лежит вне $INSTDIR и переживала удаление,
+  ; а потом всплывала при следующей установке как чужая настройка.
+  Delete "$LOCALAPPDATA\${APP}\settings.json"
+  RMDir  "$LOCALAPPDATA\${APP}"
 
   DeleteRegKey HKCU "${REGKEY}"
   DeleteRegKey HKCU "Software\${APP}"

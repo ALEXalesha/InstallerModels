@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""Проверки на всё, что уже ломалось. Запуск: python tests.py
+
+Зависимостей нет нарочно: build.py гоняет их перед сборкой, а сборка идёт на
+голом Python. Сеть тоже не нужна - Hugging Face изображает локальный сервер,
+которому можно велеть рвать соединение когда захочется.
+"""
+
+import http.server
+import json
+import socketserver
+import sys
+import tempfile
+import threading
+import traceback
+from pathlib import Path
+
+import core
+
+BODY = bytes(range(256)) * 400  # 102400 байт
+SIZE = len(BODY)
+
+CASES = []
+
+
+def case(fn):
+    CASES.append(fn)
+    return fn
+
+
+# --------------------------------------------------------------- сервер-макет
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    mode = "whole"
+    hits = 0
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        Handler.hits += 1
+        span = self.headers.get("Range")
+        start = int(span.split("=")[1].split("-")[0]) if span else 0
+
+        if Handler.mode == "gated":
+            self.reply(403)
+            return
+        if Handler.mode == "gone":
+            self.reply(404)
+            return
+        if Handler.mode == "norange":  # сервер не умеет Range и шлёт файл целиком
+            self.reply(200, len(BODY))
+            self.wfile.write(BODY)
+            return
+        if start >= len(BODY):
+            self.reply(416)
+            return
+
+        if span:
+            self.reply(206, len(BODY) - start, f"bytes {start}-{len(BODY)-1}/{len(BODY)}")
+        else:
+            self.reply(200, len(BODY))
+
+        if Handler.mode == "flaky":  # рвёт после каждых 7000 байт
+            self.wfile.write(BODY[start:start + 7000])
+            self.close_connection = True
+            return
+        if Handler.mode == "silent":  # соединение есть, новых байт нет никогда
+            self.close_connection = True
+            return
+        self.wfile.write(BODY[start:])
+
+    def reply(self, code, length=0, span=None):
+        self.send_response(code)
+        if span:
+            self.send_header("Content-Range", span)
+        self.send_header("Content-Length", str(length))
+        self.end_headers()
+
+
+class Server(socketserver.TCPServer):
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        pass  # соединения рвём нарочно, ругань в консоль не нужна
+
+
+def serve(mode):
+    Handler.mode = mode
+    Handler.hits = 0
+
+
+# ----------------------------------------------------------------- сами тесты
+
+@case
+def resume_survives_a_hundred_drops():
+    """Обрывы, каждый из которых сдвигает файл, кончаться не должны никогда.
+
+    Счётчик повторов раньше считался на весь файл, и пятый обрыв убивал закачку
+    даже там, где каждый честно дописывал очередной кусок. На 30 ГБ обрывов
+    бывает под сотню - такой файл не докачивался вообще.
+    """
+    serve("flaky")
+    dest = TMP / "flaky.bin"
+    core.fetch(URL, dest, SIZE)
+    assert dest.read_bytes() == BODY, "докачанный файл не совпал с исходным"
+    assert Handler.hits == 15, f"ждали 15 подходов по 7000 байт, вышло {Handler.hits}"
+
+
+@case
+def dead_stream_gives_up_instead_of_looping():
+    """Ноль новых байт - это не прогресс. Иначе цикл повторов был бы вечным."""
+    serve("silent")
+    dest = TMP / "silent.bin"
+    try:
+        core.fetch(URL, dest, SIZE)
+    except RuntimeError as err:
+        assert "server sent no new bytes" in str(err), err
+    else:
+        raise AssertionError("молчащий сервер обязан был кончиться ошибкой")
+    assert Handler.hits == core.RETRIES, f"подходов {Handler.hits}, ждали {core.RETRIES}"
+
+
+@case
+def unfinished_part_is_never_thrown_away():
+    """Сдались - и ладно, но недокачанное обязано дожить до следующего запуска."""
+    serve("silent")
+    dest = TMP / "keep.bin"
+    core.part_path(dest).write_bytes(BODY[:50000])
+    try:
+        core.fetch(URL, dest, SIZE)
+    except RuntimeError:
+        pass
+    assert core.part_path(dest).stat().st_size == 50000, "недокачанный кусок стёрли"
+
+
+@case
+def resume_continues_from_the_part():
+    serve("whole")
+    dest = TMP / "resume.bin"
+    core.part_path(dest).write_bytes(BODY[:40000])
+    core.fetch(URL, dest, SIZE)
+    assert dest.read_bytes() == BODY
+    assert Handler.hits == 1, f"докачка должна была уложиться в один запрос, вышло {Handler.hits}"
+
+
+@case
+def whole_part_needs_no_request_at_all():
+    serve("whole")
+    dest = TMP / "done.bin"
+    core.part_path(dest).write_bytes(BODY)
+    core.fetch(URL, dest, SIZE)
+    assert dest.read_bytes() == BODY
+    assert Handler.hits == 0, "целый .part качать заново незачем"
+
+
+@case
+def server_without_range_still_works():
+    serve("norange")
+    dest = TMP / "norange.bin"
+    core.part_path(dest).write_bytes(BODY[:40000])
+    core.fetch(URL, dest, SIZE)
+    assert dest.read_bytes() == BODY, "сервер прислал файл целиком, а дописали в хвост"
+
+
+@case
+def wrong_size_in_manifest_is_named_out_loud():
+    serve("whole")
+    try:
+        core.fetch(URL, TMP / "badsize.bin", 999)
+    except RuntimeError as err:
+        assert "manifest is out of date" in str(err), err
+        assert "102400" in str(err), "в ошибке нет настоящего размера, чинить нечем"
+    else:
+        raise AssertionError("расхождение размеров обязано было всплыть")
+
+
+@case
+def gated_repo_does_not_blame_the_path():
+    """403 - это лицензия, которую не приняли, а не переехавший файл."""
+    serve("gated")
+    try:
+        core.fetch(URL, TMP / "gated.bin", SIZE)
+    except RuntimeError as err:
+        assert "gated" in str(err) and "HF_TOKEN" in str(err), err
+    else:
+        raise AssertionError("403 обязан был кончиться ошибкой")
+
+
+@case
+def missing_file_blames_the_path():
+    serve("gone")
+    try:
+        core.fetch(URL, TMP / "gone.bin", SIZE)
+    except RuntimeError as err:
+        assert "models.json" in str(err), err
+    else:
+        raise AssertionError("404 обязан был кончиться ошибкой")
+
+
+@case
+def cancel_keeps_what_was_downloaded():
+    serve("whole")
+    dest = TMP / "cancel.bin"
+    try:
+        core.fetch(URL, dest, SIZE, should_stop=lambda: True)
+    except core.Cancelled:
+        pass
+    else:
+        raise AssertionError("отмена обязана была всплыть наверх")
+    assert not dest.exists(), "недокачанное нельзя выдавать за готовый файл"
+
+
+@case
+def dest_outside_the_root_is_refused():
+    """Path("C:/ComfyUI") / "C:/qwe.bin" - это просто "C:/qwe.bin". Опечатка в
+    dest писала мимо папки ComfyUI, и никто этого не проверял."""
+    for bad in ("C:/Windows/evil.dll", "../../evil.bin", "models/../../x", "", "."):
+        try:
+            core.dest_path("C:/ComfyUI", bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"кривой dest прошёл: {bad!r}")
+    good = core.dest_path("C:/ComfyUI", "models/vae/x.safetensors")
+    assert good == Path("C:/ComfyUI/models/vae/x.safetensors"), good
+
+
+@case
+def manifest_is_checked_when_it_is_read():
+    bad = TMP / "bad.json"
+    bad.write_text(json.dumps({
+        "comfyui_root": "C:/ComfyUI",
+        "groups": {"x": {"files": [{"dest": "../out.bin", "size": 1}]}},
+    }), encoding="utf-8")
+    try:
+        core.load_manifest(bad)
+    except ValueError:
+        return
+    raise AssertionError("кривой dest должен всплывать при чтении models.json")
+
+
+@case
+def shipped_manifest_is_sane():
+    """Тот самый models.json, который уезжает внутрь exe."""
+    manifest = core.load_manifest(HERE / "models.json")
+    seen = {}
+    for name, group in manifest["groups"].items():
+        assert group["files"], f"группа {name} пустая"
+        for entry in group["files"]:
+            for field in ("repo", "path", "dest", "size"):
+                assert field in entry, f"{name}: нет поля {field}"
+            assert isinstance(entry["size"], int) and entry["size"] > 0, entry
+            first = seen.setdefault(entry["dest"], (name, entry))
+            assert first[1] == entry, f"{entry['dest']}: разные записи в {first[0]} и {name}"
+    for model in manifest["lmstudio"]:
+        for field in ("search", "quant", "files"):
+            assert field in model, f"lmstudio: нет поля {field}"
+
+
+@case
+def status_sees_the_part_file():
+    """Оборванная закачка лежит под именем .part, и до неё раньше не смотрели:
+    гигабайты на диске числились как "ничего нет"."""
+    root = TMP / "root"
+    entry = {"dest": "models/vae/x.bin", "size": SIZE}
+    (root / "models/vae").mkdir(parents=True, exist_ok=True)
+    assert core.status(entry, root) == ("missing", 0)
+
+    core.part_path(root / entry["dest"]).write_bytes(BODY[:100])
+    assert core.status(entry, root) == ("partial", 100)
+    assert core.needed_bytes([entry], root) == SIZE - 100, "место под .part просят заново"
+
+    (root / entry["dest"]).write_bytes(BODY)
+    assert core.status(entry, root) == ("ok", SIZE)
+
+
+@case
+def sizes_read_the_way_people_expect():
+    assert core.human(0) == "0 B"
+    assert core.human(1024) == "1.0 KiB"
+    assert core.human(SIZE) == "100.0 KiB"
+    assert core.human(30 * 1024 ** 3) == "30.0 GiB"
+
+
+@case
+def window_title_matches_the_installer():
+    """Установщик ищет запущенную программу через FindWindow по заголовку окна.
+    Разъедутся строки - он молча начнёт затирать файлы под работающей программой."""
+    import re
+    in_gui = re.search(r'window\.title\("([^"]*)"\)', (HERE / "gui.py").read_text(encoding="utf-8"))
+    in_nsi = re.search(r'!define WINTITLE "([^"]*)"',
+                       (HERE / "setup.nsi").read_text(encoding="utf-8-sig"))
+    assert in_gui and in_nsi, "не нашёл заголовок в gui.py или setup.nsi"
+    assert in_gui.group(1) == in_nsi.group(1), f"{in_gui.group(1)!r} != {in_nsi.group(1)!r}"
+
+
+@case
+def versions_match_everywhere():
+    import re
+    in_build = re.search(r'VERSION = "([^"]*)"', (HERE / "build.py").read_text(encoding="utf-8"))
+    text = (HERE / "setup.nsi").read_text(encoding="utf-8-sig")
+    in_nsi = re.search(r'!define VERSION "([^"]*)"', text)
+    assert in_build and in_nsi, "не нашёл версию в build.py или setup.nsi"
+    assert in_build.group(1) == in_nsi.group(1), f"{in_build.group(1)} != {in_nsi.group(1)}"
+    assert f"/DVERSION={in_build.group(1)} setup.nsi" in text, \
+        "команда для ручной сборки в шапке setup.nsi осталась на старой версии"
+
+
+@case
+def nsi_keeps_its_bom():
+    """Без BOM makensis читает файл как ANSI и молча портит всю кириллицу."""
+    assert (HERE / "setup.nsi").read_bytes().startswith(b"\xef\xbb\xbf"), \
+        "setup.nsi должен быть в UTF-8 с BOM"
+
+
+# ------------------------------------------------------------------- прогон
+
+HERE = Path(__file__).resolve().parent
+TMP = Path(tempfile.mkdtemp(prefix="installer-tests-"))
+URL = None
+
+
+def main():
+    global URL
+    core.wait_before_retry = lambda seconds, should_stop: None  # не ждём по пять секунд
+
+    server = Server(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    URL = f"http://127.0.0.1:{server.server_address[1]}/model.safetensors"
+
+    failed = 0
+    for fn in CASES:
+        try:
+            fn()
+        except Exception:
+            failed += 1
+            print(f"ПРОВАЛ  {fn.__name__}")
+            print("        " + traceback.format_exc().strip().replace("\n", "\n        "))
+        else:
+            print(f"ок      {fn.__name__}")
+
+    server.shutdown()
+    print(f"\n{len(CASES) - failed} из {len(CASES)} прошло")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

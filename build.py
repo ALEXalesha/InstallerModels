@@ -8,13 +8,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-from core import dest_parts
+from core import check_manifest as check_manifest_shape
 
 HERE = Path(__file__).resolve().parent
 DIST = HERE / "dist"
 WORK = HERE / "build"
 APP = "InstallerModels"
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 
 TITLE_IN_GUI = r'window\.title\("([^"]*)"\)'
 TITLE_IN_NSI = r'!define WINTITLE "([^"]*)"'
@@ -109,64 +109,38 @@ def check_tests():
 
 
 def check_pyinstaller():
-    """Зовут его уже после того, как dist/ и build/ стёрты. Не найдётся - и от
-    прошлой сборки ничего не останется, а новая не появится."""
+    """Спрашиваем до очистки dist/ и build/. Не найдётся после - и от прошлой
+    сборки ничего не осталось бы, а новая не появилась."""
     probe = subprocess.run([sys.executable, "-m", "PyInstaller", "--version"],
                            capture_output=True)
     if probe.returncode:
         sys.exit("PyInstaller не найден: python -m pip install pyinstaller")
 
 
-def check_fields(where, entry, fields):
-    """Кавычки внутри f-строки намеренно не вкладываются: так файл читается и
-    Python 3.8, который в доках обещан как нижняя граница. Вложенные заработали
-    только с 3.12, и на 3.11 сборка падала не с понятной ошибкой, а SyntaxError
-    ещё до первой строчки работы."""
-    missing = [f for f in fields if f not in entry]
-    if missing:
-        sys.exit(f"{where}: нет полей " + ", ".join(missing))
-    if "size" in fields:
-        size = entry["size"]
-        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
-            sys.exit(f"{where}: size должен быть целым числом байт, а там {size!r}")
-
-
 def check_manifest():
     """models.json уезжает внутрь exe. Битый или неполный - программа откроется
-    и сразу покажет ошибку, а узнаем мы об этом уже после сборки."""
+    и сразу покажет ошибку, а узнаем мы об этом уже после сборки.
+
+    Сама форма манифеста проверяется тем же кодом, что и при запуске программы:
+    здесь лежала своя копия проверок, и копия успела отстать от оригинала. Всё,
+    что остаётся снаружи, - раздел lmstudio целиком и title_ru у групп. При
+    запуске без них можно жить (вкладка будет пустой, названия возьмутся из
+    title), а вот в собранный exe они уезжать не должны.
+    """
     try:
         manifest = json.loads((HERE / "models.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as err:
         sys.exit(f"models.json не читается: {err}")
-    for key in ("comfyui_root", "groups", "lmstudio"):
-        if key not in manifest:
-            sys.exit(f"в models.json нет ключа {key}")
+    try:
+        check_manifest_shape(manifest)
+    except ValueError as err:
+        sys.exit(str(err))
 
-    # Один и тот же dest с разными repo/size в двух группах: качается он один
-    # раз, по первой записи, и вторая группа навсегда остаётся «частично».
-    seen = {}
+    if not manifest.get("lmstudio"):
+        sys.exit("в models.json нет раздела lmstudio, вкладка окна будет пустой")
     for name, group in manifest["groups"].items():
-        check_fields(f"группа {name}", group, ("title", "title_ru", "files"))
-        for entry in group["files"]:
-            check_fields(f"группа {name}, файл {entry.get('dest', '?')}",
-                         entry, ("repo", "path", "dest", "size"))
-            # Абсолютный путь или ".." в dest уводят запись мимо папки ComfyUI:
-            # Path(root) / "C:/qwe.bin" - это просто "C:/qwe.bin". Ловим здесь,
-            # чтобы такая опечатка не уехала внутрь собранного exe.
-            try:
-                dest_parts(entry["dest"])
-            except ValueError as err:
-                sys.exit(f"группа {name}: {err}")
-            first_group, first_entry = seen.setdefault(entry["dest"], (name, entry))
-            if first_entry != entry:
-                sys.exit(f"{entry['dest']}: разные записи в группах {first_group} и {name}")
-
-    # Вкладку LM Studio окно строит из этих же полей, а проверял их до сих пор
-    # никто: опечатка ловилась уже запущенным exe, то есть после всей сборки.
-    for model in manifest["lmstudio"]:
-        check_fields("раздел lmstudio", model, ("search", "quant", "files"))
-        for item in model["files"]:
-            check_fields(f"lmstudio {model['search']}", item, ("name", "size"))
+        if not isinstance(group.get("title_ru"), str) or not group["title_ru"]:
+            sys.exit(f"группа {name}: нет строки title_ru, окно покажет английское название")
 
 
 def preflight():
@@ -205,6 +179,11 @@ def main():
     pyinstaller("--onedir", payload, WORK / "onedir")
     shutil.copy2(HERE / "models.json", payload / APP / "models.json")
     shutil.copy2(HERE / "README.md", payload / APP / "README.md")
+
+    # setup.nsi берёт файлы по жёстко записанному пути. Разъедется он с тем, что
+    # выложил PyInstaller, - makensis соберёт установщик из воздуха и не пожалуется.
+    if not (payload / APP / f"{APP}.exe").exists():
+        sys.exit(f"PyInstaller не положил {APP}.exe в {payload / APP}, установщик собирать не из чего")
 
     nsis = find_nsis()
     if nsis:

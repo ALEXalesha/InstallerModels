@@ -1,10 +1,10 @@
 ﻿; Установщик InstallerModels. Ставит для текущего пользователя, без прав администратора.
-; Собирается из build.py, вручную: makensis /DVERSION=1.0.3 setup.nsi
+; Собирается из build.py, вручную: makensis /DVERSION=1.0.4 setup.nsi
 
 Unicode true
 
 !ifndef VERSION
-  !define VERSION "1.0.3"
+  !define VERSION "1.0.4"
 !endif
 
 !define APP     "InstallerModels"
@@ -121,6 +121,15 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\${APP}\Удалить ${APP}.lnk"
   RMDir  "$SMPROGRAMS\${APP}"
 
+  ; Сносим папку целиком, но только убедившись, что это действительно наша папка:
+  ; $INSTDIR приходит из реестра, и RMDir /r по чужому пути - это уже не удаление
+  ; программы. Перечислять файлы поимённо мало: набор их меняется от версии к
+  ; версии, а RMDir без /r на непустой папке молча ничего не делает, и огрызок
+  ; оставался лежать навсегда - вместе с записью «удалено» в «Программах».
+  IfFileExists "$INSTDIR\${APP}.exe" 0 +2
+    RMDir /r "$INSTDIR"
+
+  ; Если exe кто-то унёс руками, ограничиваемся тем, что клали сами.
   RMDir /r "$INSTDIR\_internal"
   Delete "$INSTDIR\${APP}.exe"
   Delete "$INSTDIR\models.json"

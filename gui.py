@@ -22,9 +22,9 @@ from core import (
     load_manifest,
     manifest_path,
     needed_bytes,
+    part_path,
     pending,
     remember_root,
-    saved_root,
     status,
 )
 
@@ -101,10 +101,9 @@ class App(ttk.Frame):
         self.manifest = load_manifest()
         # Папку, выбранную «Обзором», помним между запусками: раньше её
         # приходилось искать заново каждый раз, а путь из models.json почти
-        # никому не подходил.
-        self.root_path = tk.StringVar(
-            value=saved_root() or str(comfy_root(self.manifest))
-        )
+        # никому не подходил. Порядок источников теперь один на окно и на
+        # консоль и живёт в comfy_root(), а не в двух местах по-своему.
+        self.root_path = tk.StringVar(value=str(comfy_root(self.manifest)))
         self.events = queue.Queue()
         self.stop_flag = threading.Event()
         self.worker = None
@@ -211,7 +210,7 @@ class App(ttk.Frame):
                  " в поиск внутри LM Studio.",
         ).grid(row=0, column=0, sticky="we", pady=(0, 10))
 
-        for n, model in enumerate(self.manifest["lmstudio"], start=1):
+        for n, model in enumerate(self.manifest.get("lmstudio", []), start=1):
             total = sum(f["size"] for f in model["files"])
             box = ttk.LabelFrame(page, text=f" {model['search'].split('/')[-1]} ", padding=8)
             box.grid(row=n, column=0, sticky="we", pady=4)
@@ -291,7 +290,10 @@ class App(ttk.Frame):
 
     def refresh(self):
         root = self.current_root()
-        if not root.exists():
+        # is_dir(), а не exists(): файл с именем папки проходил проверку насквозь,
+        # а спотыкалась об него уже запись первого куска - в лог падало сырое
+        # NotADirectoryError вместо понятного «это не папка».
+        if not root.is_dir():
             self.disk_label.configure(text="папка не найдена", foreground="#c0392b")
             for row in self.rows.values():
                 row.state.configure(text="путь не найден", foreground="#c0392b")
@@ -325,7 +327,7 @@ class App(ttk.Frame):
         if self.worker and self.worker.is_alive():
             return
         root = self.current_root()
-        if not root.exists():
+        if not root.is_dir():
             messagebox.showerror("Папка не найдена", f"Нет такой папки:\n{root}")
             return
 
@@ -367,7 +369,8 @@ class App(ttk.Frame):
         self.total_bar.configure(value=0)
         self.log(f"начинаю: {len(job)} файлов, {size_ru(total)}")
 
-        self.worker = threading.Thread(target=self.run_job, args=(job, root, total), daemon=True)
+        self.worker = threading.Thread(target=self.run_job,
+                                       args=(job, root, total, need), daemon=True)
         self.worker.start()
 
     def cancel(self):
@@ -375,14 +378,34 @@ class App(ttk.Frame):
         self.cancel_button.configure(state="disabled")
         self.log("отмена, дожидаюсь текущего куска")
 
-    def run_job(self, job, root, total):
+    @staticmethod
+    def part_size(root, entry):
+        part = part_path(dest_path(root, entry["dest"]))
+        return part.stat().st_size if part.exists() else 0
+
+    def run_job(self, job, root, total, need):
         """Работает в отдельном потоке. Общается с окном только через очередь.
+
+        total - полный объём очереди, need - сколько из него ещё предстоит вытянуть
+        из сети. Раньше в поток уезжало только total, и обе цифры окна врали после
+        обрыва: полоска «всего» начинала с нуля там, где на диске уже лежало почти
+        всё, а время до конца считалось по всему объёму и обещало часы вместо минут.
 
         Событие done уходит через finally: без этого любая неожиданная ошибка
         оставила бы окно с заблокированной кнопкой и без единого объяснения.
         """
         put = self.events.put
-        finished_bytes = 0
+
+        # Сколько уже лежит в .part у файлов, до которых очередь ещё не дошла.
+        # ahead[i] - сумма по всем файлам после i-го, снятая один раз на старте.
+        ahead, tail = [], 0
+        for entry in reversed(job):
+            ahead.append(tail)
+            tail += self.part_size(root, entry)
+        ahead.reverse()
+
+        finished_bytes = 0   # объём файлов, с которыми очередь уже закончила
+        fetched = 0          # байты, вытянутые из сети в этот заход
         failed = []
         cancelled = False
 
@@ -390,9 +413,17 @@ class App(ttk.Frame):
             for n, entry in enumerate(job, 1):
                 put(("file", f"[{n}/{len(job)}] {entry['dest']}  ({size_ru(entry['size'])})"))
                 put(("log", f"качаю {entry['dest']} из {entry['repo']}"))
+                had = self.part_size(root, entry)
+                rest = ahead[n - 1]
 
-                def on_progress(done, size, speed, base=finished_bytes):
-                    put(("progress", (done, size, base + done, total, speed)))
+                def on_progress(done, size, speed, base=finished_bytes, rest=rest,
+                                had=had, got=fetched):
+                    # done приходит вместе с уже лежавшими байтами, поэтому из сети
+                    # за этот заход взято ровно done - had. При перезапуске файла с
+                    # нуля done становится меньше had, и тогда это просто ноль.
+                    pulled = got + max(done - had, 0)
+                    put(("progress", (done, size, base + rest + done, total, speed,
+                                      need - pulled)))
 
                 try:
                     fetch(
@@ -405,16 +436,27 @@ class App(ttk.Frame):
                     )
                 except Cancelled:
                     put(("log", "остановлено, недокачанный кусок сохранён для докачки"))
+                    fetched += max(self.part_size(root, entry) - had, 0)
                     cancelled = True
                     break
                 except Exception as err:
                     put(("log", f"ОШИБКА {entry['dest']}: {err}"))
                     failed.append(entry["dest"])
-                else:
-                    put(("log", f"готово {entry['dest']}"))
+                    # Сломавшийся файл не дорос до своего размера, и засчитывать его
+                    # целиком нельзя: полоска «файл» показывала полную заливку ровно
+                    # на том файле, про который в логе написано ОШИБКА.
+                    got = self.part_size(root, entry)
+                    fetched += max(got - had, 0)
+                    finished_bytes += got
+                    put(("progress", (got, entry["size"], finished_bytes + rest,
+                                      total, 0, need - fetched)))
+                    continue
 
+                put(("log", f"готово {entry['dest']}"))
+                fetched += max(entry["size"] - had, 0)
                 finished_bytes += entry["size"]
-                put(("progress", (entry["size"], entry["size"], finished_bytes, total, 0)))
+                put(("progress", (entry["size"], entry["size"], finished_bytes + rest,
+                                  total, 0, need - fetched)))
         except Cancelled:
             cancelled = True
         except Exception as err:
@@ -429,13 +471,15 @@ class App(ttk.Frame):
         elif kind == "file":
             self.file_label.configure(text=payload)
         elif kind == "progress":
-            done, size, overall, total, speed = payload
+            done, size, overall, total, speed, left = payload
             self.file_bar.configure(value=done * 1000 / size if size else 0)
             self.total_bar.configure(value=overall * 1000 / total if total else 0)
             if speed > 0:
+                # Время считаем по тому, что ещё лететь по сети, а не по остатку
+                # полоски: недокачанное уже на диске и времени больше не займёт.
                 self.speed_label.configure(
                     text=f"{size_ru(speed)}/с   осталось всего примерно "
-                         f"{eta_text((total - overall) / speed)}"
+                         f"{eta_text(left / speed)}"
                 )
             else:
                 self.speed_label.configure(text="")

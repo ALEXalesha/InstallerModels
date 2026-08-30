@@ -8,6 +8,8 @@
 
 import http.server
 import json
+import os
+import shutil
 import socketserver
 import sys
 import tempfile
@@ -52,6 +54,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if Handler.mode == "norange":  # сервер не умеет Range и шлёт файл целиком
             self.reply(200, len(BODY))
             self.wfile.write(BODY)
+            return
+        if Handler.mode == "norangeflaky":  # Range не умеет и вдобавок рвёт связь
+            self.reply(200, len(BODY))
+            self.wfile.write(BODY[:7000])
+            self.close_connection = True
             return
         if start >= len(BODY):
             self.reply(416)
@@ -242,20 +249,18 @@ def manifest_is_checked_when_it_is_read():
 
 @case
 def shipped_manifest_is_sane():
-    """Тот самый models.json, который уезжает внутрь exe."""
-    manifest = core.load_manifest(HERE / "models.json")
-    seen = {}
+    """Тот самый models.json, который уезжает внутрь exe.
+
+    Форму проверяет core.check_manifest - тот же код, что и при запуске программы.
+    Копия проверок жила тут и в build.py, и копии успели разойтись с оригиналом.
+    Здесь остаётся то, чего при запуске можно и не иметь, а в собранном exe нельзя:
+    русские названия групп и непустой раздел lmstudio - без них вкладка LM Studio
+    открывается пустой, а список групп говорит по-английски.
+    """
+    manifest = core.load_manifest(HERE / "models.json")  # тут же и check_manifest
+    assert manifest["lmstudio"], "раздел lmstudio пуст, вкладка окна будет пустой"
     for name, group in manifest["groups"].items():
-        assert group["files"], f"группа {name} пустая"
-        for entry in group["files"]:
-            for field in ("repo", "path", "dest", "size"):
-                assert field in entry, f"{name}: нет поля {field}"
-            assert isinstance(entry["size"], int) and entry["size"] > 0, entry
-            first = seen.setdefault(entry["dest"], (name, entry))
-            assert first[1] == entry, f"{entry['dest']}: разные записи в {first[0]} и {name}"
-    for model in manifest["lmstudio"]:
-        for field in ("search", "quant", "files"):
-            assert field in model, f"lmstudio: нет поля {field}"
+        assert group.get("title_ru"), f"группа {name}: нет title_ru"
 
 
 @case
@@ -314,6 +319,118 @@ def nsi_keeps_its_bom():
         "setup.nsi должен быть в UTF-8 с BOM"
 
 
+@case
+def a_server_without_range_cannot_loop_forever():
+    """Сервер, который не умеет Range и вдобавок рвёт связь, гонял бесконечный круг.
+
+    Счётчик обрывов обнулялся по «файл вырос», а каждый заход начинался с нуля и
+    рос заново - выйти из этого круга было нечем. Окно и консоль качали один и тот
+    же кусок, пока человек не нажмёт Отмену. Перезапуски теперь считаются отдельно.
+    """
+    serve("norangeflaky")
+    try:
+        core.fetch(URL, TMP / "loop.bin", SIZE)
+    except RuntimeError as err:
+        assert "from the start" in str(err), err
+    else:
+        raise AssertionError("вечный круг обязан был кончиться ошибкой")
+    assert Handler.hits == core.RETRIES + 2, f"подходов {Handler.hits}, ждали {core.RETRIES + 2}"
+
+
+@case
+def a_write_error_is_not_a_dropped_connection():
+    """Локальная ошибка записи - это не обрыв связи, и повторять её незачем.
+
+    open() отдаёт тот же OSError, что и сокет, и папка только для чтения уходила
+    в пять подходов по пять секунд, а в конце жаловалась на связь.
+    """
+    serve("whole")
+    dest = TMP / "readonly.bin"
+    core.part_path(dest).mkdir()  # в папку не запишешь, а ошибка тем же OSError
+    notes = []
+    try:
+        core.fetch(URL, dest, SIZE, on_note=notes.append)
+    except RuntimeError as err:
+        assert "cannot write" in str(err), err
+    else:
+        raise AssertionError("невозможная запись обязана была кончиться ошибкой")
+    assert not notes, f"локальную ошибку разбирали как обрыв связи: {notes}"
+
+
+@case
+def a_broken_manifest_never_shows_a_python_traceback():
+    """Любая кривизна в models.json обязана всплывать одним ValueError.
+
+    Запись без dest давала KeyError, groups списком - AttributeError, а size
+    строкой не давал ничего и ронял окно уже на сложении размеров. Ни то, ни
+    другое, ни третье не ловилось except (OSError, ValueError) в install.py:
+    человек, который этот же файл руками и правил, получал трассировку Python.
+    """
+    import copy
+
+    good = {
+        "comfyui_root": "C:/ComfyUI",
+        "lmstudio": [{"search": "s/m", "quant": "Q4", "files": [{"name": "m.gguf", "size": 1}]}],
+        "groups": {"g": {"title": "t", "files": [
+            {"repo": "r", "path": "p", "dest": "models/a.bin", "size": 1}]}},
+    }
+    core.check_manifest(good)  # эталон обязан проходить
+
+    breakage = {
+        "нет dest": lambda m: m["groups"]["g"]["files"][0].pop("dest"),
+        "dest мимо папки": lambda m: m["groups"]["g"]["files"][0].update(dest="C:/evil.bin"),
+        "groups списком": lambda m: m.update(groups=[]),
+        "groups пустой": lambda m: m.update(groups={}),
+        "size строкой": lambda m: m["groups"]["g"]["files"][0].update(size="1"),
+        "size нулём": lambda m: m["groups"]["g"]["files"][0].update(size=0),
+        "size логическим": lambda m: m["groups"]["g"]["files"][0].update(size=True),
+        "нет repo": lambda m: m["groups"]["g"]["files"][0].pop("repo"),
+        "нет comfyui_root": lambda m: m.pop("comfyui_root"),
+        "нет title": lambda m: m["groups"]["g"].pop("title"),
+        "пустая группа": lambda m: m["groups"]["g"].update(files=[]),
+        "группа строкой": lambda m: m["groups"].update(g="ой"),
+        "lmstudio без quant": lambda m: m["lmstudio"][0].pop("quant"),
+        "lmstudio с size строкой": lambda m: m["lmstudio"][0]["files"][0].update(size="1"),
+        "манифест списком": None,
+    }
+    for name, damage in breakage.items():
+        broken = [] if damage is None else copy.deepcopy(good)
+        if damage is not None:
+            damage(broken)
+        try:
+            core.check_manifest(broken)
+        except ValueError:
+            continue
+        raise AssertionError(f"кривой манифест прошёл: {name}")
+
+
+@case
+def the_browsed_folder_wins_over_the_manifest():
+    """Папку из «Обзора» знало только окно, а install.py каждый раз начинал с пути
+    в models.json: одна и та же команда у окна и у консоли считала установленными
+    разные файлы. Порядок теперь один на обоих и живёт в comfy_root()."""
+    manifest = {"comfyui_root": "C:/FromManifest"}
+    was = os.environ.get("LOCALAPPDATA")
+    os.environ["LOCALAPPDATA"] = str(TMP / "appdata")
+    try:
+        assert core.comfy_root(manifest) == Path("C:/FromManifest")
+        core.remember_root("C:/FromBrowse")
+        assert core.comfy_root(manifest) == Path("C:/FromBrowse")
+        os.environ["COMFYUI_ROOT"] = "C:/FromEnv"
+        assert core.comfy_root(manifest) == Path("C:/FromEnv")
+        assert core.comfy_root(manifest, "C:/FromFlag") == Path("C:/FromFlag")
+        # Мусор в settings.json правят руками, и .get() на списке ронял окно
+        # прямо в __init__ - жалобой на нечитаемый models.json, где всё цело.
+        core.settings_path().write_text("[1, 2]", encoding="utf-8")
+        assert core.saved_root() is None
+    finally:
+        os.environ.pop("COMFYUI_ROOT", None)
+        if was is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = was
+
+
 # ------------------------------------------------------------------- прогон
 
 HERE = Path(__file__).resolve().parent
@@ -341,6 +458,9 @@ def main():
             print(f"ок      {fn.__name__}")
 
     server.shutdown()
+    # Гоняются они перед каждой сборкой, и каждый прогон оставлял в %TEMP%
+    # папку на сотню килобайт. За полгода это заметная куча ни для кого.
+    shutil.rmtree(TMP, ignore_errors=True)
     print(f"\n{len(CASES) - failed} из {len(CASES)} прошло")
     return 1 if failed else 0
 

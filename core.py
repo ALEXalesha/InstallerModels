@@ -69,18 +69,87 @@ def dest_path(root, dest):
     return Path(root).joinpath(*dest_parts(dest))
 
 
-def check_manifest_paths(manifest):
-    for group in manifest.get("groups", {}).values():
-        for entry in group.get("files", []):
-            dest_parts(entry["dest"])
+def need_text(where, entry, field):
+    value = entry.get(field)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{where}: нет строки {field}")
+    return value
+
+
+def need_size(where, entry):
+    size = entry.get("size")
+    # bool - это тоже int, а True в качестве размера файла осмысленно только для Python.
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        raise ValueError(f"{where}: size должен быть целым числом байт, а там {size!r}")
+    return size
+
+
+def check_manifest(manifest):
+    """Проверяет форму models.json целиком и жалуется только ValueError.
+
+    Раньше отсюда смотрели только на dest, а всё остальное разбиралось уже по месту.
+    Запись без поля "dest", groups в виде списка или size строкой проходили
+    загрузку насквозь и вылетали KeyError, AttributeError или TypeError где-то
+    дальше - мимо всех обработчиков, то есть трассировкой Python на человека, который
+    этот же файл руками и правил. Проверка одна на всех: и на загрузке, и в build.py.
+    """
+    if not isinstance(manifest, dict):
+        raise ValueError("models.json: ожидался объект в фигурных скобках")
+    need_text("models.json", manifest, "comfyui_root")
+
+    groups = manifest.get("groups")
+    if not isinstance(groups, dict) or not groups:
+        raise ValueError("models.json: groups должен быть непустым объектом")
+
+    # Один и тот же dest с разными repo/size в двух группах: качается он один
+    # раз, по первой записи, и вторая группа навсегда остаётся «частично».
+    seen = {}
+    for name, group in groups.items():
+        where = f"группа {name}"
+        if not isinstance(group, dict):
+            raise ValueError(f"{where}: ожидался объект")
+        need_text(where, group, "title")
+        files = group.get("files")
+        if not isinstance(files, list) or not files:
+            raise ValueError(f"{where}: files должен быть непустым списком")
+        for entry in files:
+            if not isinstance(entry, dict):
+                raise ValueError(f"{where}: запись файла должна быть объектом")
+            dest = need_text(where, entry, "dest")
+            spot = f"{where}, файл {dest}"
+            need_text(spot, entry, "repo")
+            need_text(spot, entry, "path")
+            need_size(spot, entry)
+            dest_parts(dest)
+            first_group, first_entry = seen.setdefault(dest, (name, entry))
+            if first_entry != entry:
+                raise ValueError(f"{dest}: разные записи в группах {first_group} и {name}")
+
+    # Вкладку LM Studio окно строит из этих же полей и складывает размеры через sum().
+    models = manifest.get("lmstudio", [])
+    if not isinstance(models, list):
+        raise ValueError("models.json: lmstudio должен быть списком")
+    for model in models:
+        if not isinstance(model, dict):
+            raise ValueError("раздел lmstudio: ожидался объект")
+        search = need_text("раздел lmstudio", model, "search")
+        where = f"lmstudio {search}"
+        need_text(where, model, "quant")
+        files = model.get("files")
+        if not isinstance(files, list) or not files:
+            raise ValueError(f"{where}: files должен быть непустым списком")
+        for item in files:
+            if not isinstance(item, dict):
+                raise ValueError(f"{where}: запись файла должна быть объектом")
+            need_size(f"{where}, файл {need_text(where, item, 'name')}", item)
+    return manifest
 
 
 def load_manifest(path=None):
     with open(path or manifest_path(), encoding="utf-8") as fh:
         manifest = json.load(fh)
-    # Ловим кривой dest один раз при загрузке, а не в момент записи на диск.
-    check_manifest_paths(manifest)
-    return manifest
+    # Всю кривизну ловим один раз при загрузке, а не в момент записи на диск.
+    return check_manifest(manifest)
 
 
 def settings_path():
@@ -90,13 +159,18 @@ def settings_path():
 
 def saved_root():
     """Папка, выбранная кнопкой «Обзор» в прошлый раз. До сих пор выбор жил до
-    закрытия окна, и каждый запуск начинался с пути из models.json заново."""
+    закрытия окна, и каждый запуск начинался с пути из models.json заново.
+
+    Ловим тут заодно AttributeError: settings.json правится руками, и если внутри
+    окажется список, а не объект, то .get() падал прямо в __init__ окна - вместо
+    забытой настройки человек получал окно с сообщением про нечитаемый models.json.
+    """
     try:
         with open(settings_path(), encoding="utf-8") as fh:
             value = json.load(fh).get("comfyui_root")
-    except (OSError, ValueError):
+    except (OSError, ValueError, AttributeError):
         return None
-    return str(value) if value else None
+    return str(value) if isinstance(value, str) and value else None
 
 
 def remember_root(path):
@@ -109,7 +183,14 @@ def remember_root(path):
 
 
 def comfy_root(manifest, override=None):
-    root = override or os.environ.get("COMFYUI_ROOT") or manifest["comfyui_root"]
+    """Порядок: --root, переменная окружения, папка из «Обзора», models.json.
+
+    Папку из «Обзора» до сих пор знало только окно, а install.py каждый раз начинал
+    с пути в models.json: выберешь папку мышкой - в консоли она всё равно не та,
+    и одна и та же команда у окна и у консоли считала разные файлы установленными.
+    """
+    root = (override or os.environ.get("COMFYUI_ROOT") or saved_root()
+            or manifest["comfyui_root"])
     return Path(root).expanduser()
 
 
@@ -241,6 +322,7 @@ def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None)
     last_error = None
     from_scratch = False
     stale = 0          # неудачи ПОДРЯД, ни одна из которых не сдвинула файл
+    restarts = 0       # сколько раз файл пришлось начинать с нуля
     best = on_disk()   # самый большой размер .part, который мы вообще видели
 
     def keep_trying(reason, text):
@@ -278,6 +360,7 @@ def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None)
             # свой размер и станет ясно, что кусок и правда лишний.
             have = on_disk()
             offset = 0 if from_scratch or have > expected else have
+            from_scratch = False  # ровно на один заход, иначе Range больше не спросим
             if offset == expected:
                 break
 
@@ -329,12 +412,36 @@ def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None)
                 offset = 0
             mode = "ab" if offset else "wb"
             if mode == "wb":
+                # Начать файл заново - это не прогресс, сколько бы байт ни пришло
+                # потом. Планка best тут обнуляется вместе с файлом, а значит
+                # счётчик обрывов подряд обнулялся бы после каждого захода: сервер
+                # без поддержки Range на рваной связи гонял этот круг вечно, и ни
+                # окно, ни консоль из него уже не выходили - только Отмена или Ctrl+C.
+                # Перезапуски считаем отдельно, и их запас тоже кончается.
+                if have:
+                    restarts += 1
+                    if restarts > RETRIES:
+                        resp.close()
+                        last_error = "server keeps sending the file from the start"
+                        break
+                    note(f"starting over from zero ({restarts}/{RETRIES})")
                 best = 0  # файл сейчас обнулится, старая планка уже не про него
+
+            # Открываем файл до сетевого try: PermissionError и NotADirectoryError -
+            # это тоже OSError, и они попадали в разбор обрывов связи. Двадцать секунд
+            # повторов и жалоба на связь там, где мешала папка только для чтения.
+            try:
+                out = open(part, mode)
+            except OSError as err:
+                resp.close()
+                if disk_is_full(err):
+                    raise RuntimeError(NO_SPACE_MESSAGE) from None
+                raise RuntimeError(f"cannot write {part}: {err}") from None
 
             started = time.monotonic()
             done = offset
             try:
-                with resp, open(part, mode) as out:
+                with resp, out:
                     while True:
                         if should_stop and should_stop():
                             raise Cancelled

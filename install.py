@@ -190,7 +190,9 @@ def main():
     parser.add_argument("--check", action="store_true", help="verify what is on disk")
     parser.add_argument("--lmstudio", action="store_true", help="show LM Studio model names")
     parser.add_argument("--dry-run", action="store_true", help="show what would download")
-    parser.add_argument("--root", help="ComfyUI folder (overrides models.json)")
+    parser.add_argument("--root",
+                        help="ComfyUI folder (beats COMFYUI_ROOT, the remembered "
+                             "folder and models.json)")
     args = parser.parse_args()
 
     if args.lmstudio:
@@ -205,9 +207,11 @@ def main():
             print("\nusage:  python install.py ltx qwen   |   python install.py --all")
         return 0
 
-    if not root.exists():
+    # is_dir(), а не exists(): файл с именем папки проходил проверку насквозь,
+    # и спотыкалась об него уже запись первого куска - сырым NotADirectoryError.
+    if not root.is_dir():
         print(f"ComfyUI folder not found: {root}")
-        print("pass --root PATH or edit comfyui_root in models.json")
+        print("pass --root PATH, set COMFYUI_ROOT or edit comfyui_root in models.json")
         return 1
 
     if args.check:

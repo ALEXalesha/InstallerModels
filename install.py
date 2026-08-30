@@ -1,82 +1,51 @@
 #!/usr/bin/env python3
-"""Restore ComfyUI models from Hugging Face. Stdlib only, resumable."""
+"""Restore ComfyUI models from Hugging Face. Command line front end."""
 
 import argparse
-import json
-import os
 import shutil
 import sys
 import time
-import urllib.error
-import urllib.request
-from pathlib import Path
-from urllib.parse import quote
 
-HERE = Path(__file__).resolve().parent
-MANIFEST = HERE / "models.json"
-RETRIES = 5
-CHUNK = 1 << 20
-
-
-def human(nbytes):
-    size = float(nbytes)
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if abs(size) < 1024 or unit == "TiB":
-            return f"{size:.0f} B" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1024
-
-
-def load_manifest():
-    with open(MANIFEST, encoding="utf-8") as fh:
-        return json.load(fh)
-
-
-def comfy_root(manifest, override):
-    root = override or os.environ.get("COMFYUI_ROOT") or manifest["comfyui_root"]
-    return Path(root).expanduser()
-
-
-def hf_url(repo, path):
-    return f"https://huggingface.co/{repo}/resolve/main/{quote(path)}"
-
-
-def open_stream(url, offset):
-    req = urllib.request.Request(url, headers={"User-Agent": "InstallerModels/1.0"})
-    if offset:
-        req.add_header("Range", f"bytes={offset}-")
-    resp = urllib.request.urlopen(req, timeout=60)
-    return resp, resp.getcode() == 206
-
+from core import (
+    Cancelled,
+    comfy_root,
+    fetch,
+    group_size,
+    group_state,
+    hf_url,
+    human,
+    load_manifest,
+    pending,
+    status,
+)
 
 INTERACTIVE = sys.stdout.isatty()
+
+STATE_WORD = {"installed": "installed", "partial": "partial", "missing": "not installed"}
 
 
 class Progress:
     """Redraws one line in a terminal, prints every 10% when piped to a file."""
 
-    def __init__(self, total, offset):
+    def __init__(self, total):
         self.total = total
-        self.offset = offset
-        self.started = time.monotonic()
         self.next_step = 0
 
-    def update(self, done):
-        elapsed = max(time.monotonic() - self.started, 1e-6)
-        speed = (done - self.offset) / elapsed
-        pct = done * 100 / self.total if self.total else 0
-        eta = (self.total - done) / speed if speed > 0 else 0
+    def update(self, done, total, speed):
+        pct = done * 100 / total if total else 0
+        eta = (total - done) / speed if speed > 0 else 0
         clock = f"{int(eta // 60):3d}:{int(eta % 60):02d}"
 
         if INTERACTIVE:
-            filled = int(28 * done / self.total) if self.total else 0
+            filled = int(28 * done / total) if total else 0
             bar = "#" * filled + "-" * (28 - filled)
             sys.stdout.write(
-                f"\r  [{bar}] {pct:5.1f}%  {human(done)} / {human(self.total)}"
+                f"\r  [{bar}] {pct:5.1f}%  {human(done)} / {human(total)}"
                 f"  {human(speed)}/s  ETA {clock}   "
             )
             sys.stdout.flush()
         elif pct >= self.next_step:
-            print(f"  {pct:5.1f}%  {human(done)} / {human(self.total)}  {human(speed)}/s  ETA {clock}")
+            print(f"  {pct:5.1f}%  {human(done)} / {human(total)}  {human(speed)}/s  ETA {clock}")
             self.next_step = (int(pct) // 10 + 1) * 10
 
     def finish(self):
@@ -84,105 +53,13 @@ class Progress:
             sys.stdout.write("\n")
 
 
-def fetch(url, dest, expected):
-    part = dest.with_name(dest.name + ".part")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-
-    if part.exists() and part.stat().st_size > expected:
-        part.unlink()
-
-    last_error = None
-    for attempt in range(1, RETRIES + 1):
-        offset = part.stat().st_size if part.exists() else 0
-        if offset == expected:
-            break
-
-        try:
-            resp, resumed = open_stream(url, offset)
-        except urllib.error.HTTPError as err:
-            if err.code == 416 and part.exists():
-                part.unlink()
-                continue
-            if 400 <= err.code < 500:
-                raise RuntimeError(
-                    f"HTTP {err.code} from Hugging Face - file moved or renamed, "
-                    f"check repo and path in models.json"
-                ) from None
-            last_error = err
-            if attempt == RETRIES:
-                break
-            print(f"\n  server error {err.code}, retry {attempt}/{RETRIES - 1} in 5s")
-            time.sleep(5)
-            continue
-        except (urllib.error.URLError, OSError) as err:
-            last_error = err
-            if attempt == RETRIES:
-                break
-            print(f"\n  no connection ({err}), retry {attempt}/{RETRIES - 1} in 5s")
-            time.sleep(5)
-            continue
-
-        if offset and not resumed:
-            offset = 0
-        mode = "ab" if offset else "wb"
-
-        progress = Progress(expected, offset)
-        done = offset
-        try:
-            with resp, open(part, mode) as out:
-                while True:
-                    block = resp.read(CHUNK)
-                    if not block:
-                        break
-                    out.write(block)
-                    done += len(block)
-                    progress.update(done)
-        except (urllib.error.URLError, OSError) as err:
-            last_error = err
-            progress.finish()
-            if attempt == RETRIES:
-                break
-            print(f"  connection dropped ({err}), resuming in 5s")
-            time.sleep(5)
-            continue
-        progress.finish()
-
-        size_now = part.stat().st_size
-        if size_now == expected:
-            break
-        if size_now == offset:
-            print("  server sent nothing new, starting this file over")
-            part.unlink()
-
-    actual = part.stat().st_size if part.exists() else 0
-    if actual != expected:
-        reason = f" (last error: {last_error})" if last_error else ""
-        raise RuntimeError(f"got {human(actual)}, expected {human(expected)}{reason}")
-    os.replace(part, dest)
-
-
-def status(entry, root):
-    dest = root / entry["dest"]
-    if not dest.exists():
-        return "missing", 0
-    actual = dest.stat().st_size
-    return ("ok" if actual == entry["size"] else "damaged"), actual
-
-
 def cmd_list(manifest, root):
     print(f"ComfyUI root: {root}\n")
     for key, group in manifest["groups"].items():
-        total = sum(f["size"] for f in group["files"])
-        marks = [status(f, root)[0] for f in group["files"]]
-        if all(m == "ok" for m in marks):
-            state = "installed"
-        elif any(m == "ok" for m in marks):
-            state = "partial"
-        else:
-            state = "not installed"
-        print(f"  {key:<11} {human(total):>10}  {group['title']}")
+        state = STATE_WORD[group_state(group, root)]
+        print(f"  {key:<11} {human(group_size(group)):>10}  {group['title']}")
         print(f"  {'':<11} {'':>10}  {len(group['files'])} files, {state}")
-    grand = sum(f["size"] for g in manifest["groups"].values() for f in g["files"])
+    grand = sum(group_size(g) for g in manifest["groups"].values())
     print(f"\n  everything: {human(grand)}")
 
 
@@ -217,14 +94,12 @@ def cmd_lmstudio(manifest):
 
 
 def cmd_install(manifest, root, keys, dry_run):
-    queue = []
+    queue = pending(manifest, keys, root)
+    wanted = {id(e) for e in queue}
     for key in keys:
         for entry in manifest["groups"][key]["files"]:
-            state, _ = status(entry, root)
-            if state == "ok":
+            if id(entry) not in wanted:
                 print(f"skip (already there)  {entry['dest']}")
-            else:
-                queue.append(entry)
 
     if not queue:
         print("\nnothing to download")
@@ -247,11 +122,24 @@ def cmd_install(manifest, root, keys, dry_run):
     for n, entry in enumerate(queue, 1):
         print(f"\n[{n}/{len(queue)}] {entry['dest']}  ({human(entry['size'])})")
         print(f"  from {entry['repo']}/{entry['path']}")
+        bar = Progress(entry["size"])
         try:
-            fetch(hf_url(entry["repo"], entry["path"]), root / entry["dest"], entry["size"])
+            fetch(
+                hf_url(entry["repo"], entry["path"]),
+                root / entry["dest"],
+                entry["size"],
+                on_progress=bar.update,
+                on_note=lambda text: print(f"\n  {text}"),
+            )
+        except Cancelled:
+            bar.finish()
+            raise KeyboardInterrupt
         except Exception as err:
+            bar.finish()
             print(f"  FAILED: {err}")
             failed.append(entry["dest"])
+        else:
+            bar.finish()
 
     if failed:
         print(f"\n{len(failed)} file(s) failed:")

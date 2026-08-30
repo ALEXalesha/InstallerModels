@@ -4,6 +4,7 @@
   "groups": {
     "ltx": {
       "title": "LTX 2.3 - video (image/audio to video)",
+      "title_ru": "LTX 2.3 - видео из картинки и звука",
       "workflow": "video_ltx2_3_ia2v.json",
       "files": [
         {
@@ -40,6 +41,7 @@
     },
     "qwen": {
       "title": "Qwen Image Edit 2509 - image editing",
+      "title_ru": "Qwen Image Edit 2509 - редактирование картинок",
       "workflow": "image_qwen_image_edit_2509.json",
       "files": [
         {
@@ -70,6 +72,7 @@
     },
     "sdxl": {
       "title": "SDXL Juggernaut XI - image generation",
+      "title_ru": "SDXL Juggernaut XI - генерация картинок",
       "workflow": "Alex gen images.json",
       "files": [
         {
@@ -88,6 +91,7 @@
     },
     "gemma": {
       "title": "Gemma 4 E4B - text generation inside ComfyUI",
+      "title_ru": "Gemma 4 E4B - генерация текста внутри ComfyUI",
       "workflow": "llm_gemma4_text_gen.json",
       "files": [
         {
@@ -100,6 +104,7 @@
     },
     "audio": {
       "title": "ACE-Step v1 3.5B - music generation",
+      "title_ru": "ACE-Step v1 3.5B - генерация музыки",
       "workflow": "audio_ace_step_1_t2a_song.json",
       "files": [
         {
@@ -112,6 +117,7 @@
     },
     "hunyuan3d": {
       "title": "Hunyuan3D 2.1 - image to 3D mesh",
+      "title_ru": "Hunyuan3D 2.1 - картинка в 3D-модель",
       "workflow": "3d_hunyuan3d-v2.1.json",
       "files": [
         {
@@ -124,6 +130,7 @@
     },
     "clipvision": {
       "title": "CLIP ViT-H-14 vision encoder (no saved workflow uses it)",
+      "title_ru": "CLIP ViT-H-14 - кодировщик картинок, воркфлоу его не просит",
       "workflow": null,
       "files": [
         {
@@ -141,8 +148,14 @@
       "lms_key": "google/gemma-4-e2b",
       "quant": "Q4_K_M",
       "files": [
-        {"name": "gemma-4-E2B-it-Q4_K_M.gguf", "size": 3427877696},
-        {"name": "mmproj-gemma-4-E2B-it-BF16.gguf", "size": 986833248}
+        {
+          "name": "gemma-4-E2B-it-Q4_K_M.gguf",
+          "size": 3427877696
+        },
+        {
+          "name": "mmproj-gemma-4-E2B-it-BF16.gguf",
+          "size": 986833248
+        }
       ]
     },
     {
@@ -150,8 +163,14 @@
       "lms_key": "qwen/qwen3-vl-4b",
       "quant": "Q4_K_M",
       "files": [
-        {"name": "Qwen3-VL-4B-Instruct-Q4_K_M.gguf", "size": 2497281568},
-        {"name": "mmproj-Qwen3-VL-4B-Instruct-F16.gguf", "size": 836180160}
+        {
+          "name": "Qwen3-VL-4B-Instruct-Q4_K_M.gguf",
+          "size": 2497281568
+        },
+        {
+          "name": "mmproj-Qwen3-VL-4B-Instruct-F16.gguf",
+          "size": 836180160
+        }
       ]
     }
   ]

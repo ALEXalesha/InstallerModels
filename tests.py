@@ -15,6 +15,7 @@ import socketserver
 import sys
 import tempfile
 import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -23,6 +24,10 @@ import tests_matrix
 
 BODY = bytes(range(256)) * 400  # 102400 байт
 SIZE = len(BODY)
+# Сколько сервер молчит в режиме "stall". Нарочно много больше таймаута клиента:
+# только так видно, кто первым сдался. Если клиент дождётся закрытия соединения
+# сервером, а не оборвёт молчание сам, разница будет в секундах, и её видно.
+STALL = 3.0
 
 CASES = []
 
@@ -93,6 +98,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if Handler.mode == "silent":  # соединение есть, новых байт нет никогда
             self.close_connection = True
             return
+        if Handler.mode == "stall":   # соединение живо, но молчит и не закрывается
+            time.sleep(STALL)
+            self.close_connection = True
+            return
         self.wfile.write(BODY[start:])
 
     def reply(self, code, length=0, span=None):
@@ -108,6 +117,16 @@ class Server(socketserver.TCPServer):
 
     def handle_error(self, request, client_address):
         pass  # соединения рвём нарочно, ругань в консоль не нужна
+
+
+class ThreadedServer(socketserver.ThreadingTCPServer):
+    """Для проверки на молчащий сервер: обработчик там спит секундами, и на
+    однопоточном макете этот сон останавливал бы и очередь, и выключение."""
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        pass
 
 
 def serve(mode):
@@ -235,6 +254,60 @@ def cancel_keeps_what_was_downloaded():
     else:
         raise AssertionError("отмена обязана была всплыть наверх")
     assert not dest.exists(), "недокачанное нельзя выдавать за готовый файл"
+
+
+@case
+def a_stalled_connection_is_cut_by_the_timeout():
+    """Замолчавший сервер: соединение живо, а байт из него нет и не будет.
+
+    В документации было написано, что такое не ловится, - и это оказалось
+    неправдой. Ловит таймаут сокета: он отсчитывается от каждого чтения, и
+    молчание дольше TIMEOUT прилетает обычным OSError, то есть уходит в те же
+    повторы, что и обрыв. Проверить это было нечем, потому что шестьдесят
+    секунд были вписаны прямо в вызов. Теперь они вынесены в core.TIMEOUT, и
+    заодно стало видно, что за число и зачем оно.
+
+    Не ловится по-прежнему другое, и разница тут существенная: сервер, который
+    капает по байту раз в полминуты. Каждый байт заводит таймаут заново, файл
+    честно растёт, счётчик обрывов честно обнуляется. Ограничить закачку
+    целиком нельзя - файл на 30 ГиБ по медленной связи идёт часами и выглядит
+    точно так же.
+    """
+    # Сервер тут свой, отдельный, и это не прихоть. Макет однопоточный: пока
+    # обработчик спит, следующее соединение ждёт в очереди, и клиент успевает
+    # бросить его по таймауту. Доезжает оно уже во время следующей проверки и
+    # накручивает ей счётчик запросов - на общем сервере из-за этого падала
+    # соседняя проверка, а виноватой выглядела она.
+    свой = ThreadedServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=свой.serve_forever, daemon=True).start()
+    адрес = f"http://127.0.0.1:{свой.server_address[1]}/model.safetensors"
+
+    serve("stall")
+    dest = TMP / "stall.bin"
+    core.part_path(dest).write_bytes(BODY[:1000])
+    было_timeout, было_retries = core.TIMEOUT, core.RETRIES
+    core.TIMEOUT, core.RETRIES = 0.2, 2      # иначе прогон встанет на полминуты
+    started = time.monotonic()
+    try:
+        core.fetch(адрес, dest, SIZE)
+    except RuntimeError as err:
+        assert "got" in str(err), err
+    else:
+        raise AssertionError("молчащее соединение обязано было кончиться ошибкой")
+    finally:
+        core.TIMEOUT, core.RETRIES = было_timeout, было_retries
+        свой.shutdown()
+        свой.server_close()   # роняем и очередь брошенных соединений
+        serve("whole")        # счётчик общего сервера этой проверки не касается
+
+    # Порог ниже, чем молчит сервер: уложились - значит оборвали молчание сами,
+    # а не дождались, пока сервер закроет соединение. Иначе проверка проходила
+    # бы и с вовсе убранным таймаутом.
+    прошло = time.monotonic() - started
+    assert прошло < STALL, \
+        f"провисели {прошло:.1f} с при молчании {STALL} с - таймаут не сработал"
+    assert core.part_path(dest).stat().st_size == 1000, "недокачанное потеряли"
+    assert not dest.exists(), "молчание сервера не повод объявить файл готовым"
 
 
 @case

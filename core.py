@@ -14,6 +14,10 @@ from urllib.parse import quote
 
 RETRIES = 5
 CHUNK = 1 << 20
+# Отсчитывается от каждого чтения, а не от всей закачки: файл на 30 ГиБ по
+# медленной связи идёт часами, и ограничивать его целиком нельзя. Замолчавший
+# сервер этим и ловится - соединение живо, а байт из него нет.
+TIMEOUT = 60
 FROZEN = getattr(sys, "frozen", False)
 
 
@@ -411,7 +415,7 @@ def open_stream(url, offset):
         req.add_header("Authorization", f"Bearer {token}")
     if offset:
         req.add_header("Range", f"bytes={offset}-")
-    resp = urllib.request.urlopen(req, timeout=60)
+    resp = urllib.request.urlopen(req, timeout=TIMEOUT)
     return resp, resp.getcode() == 206
 
 

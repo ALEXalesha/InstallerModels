@@ -18,6 +18,7 @@ import traceback
 from pathlib import Path
 
 import core
+import tests_matrix
 
 BODY = bytes(range(256)) * 400  # 102400 байт
 SIZE = len(BODY)
@@ -608,6 +609,12 @@ def the_browsed_folder_wins_over_the_manifest():
 
 # ------------------------------------------------------------------- прогон
 
+# Матрица лежит отдельно, потому что устроена наоборот: тут список поломок,
+# которые уже случались, там перебор пространства с проверкой инвариантов.
+# Регистрируем её теми же case(), чтобы прогон и отчёт остались одни на всех.
+for check in tests_matrix.CASES:
+    case(check)
+
 HERE = Path(__file__).resolve().parent
 TMP = Path(tempfile.mkdtemp(prefix="installer-tests-"))
 URL = None
@@ -624,13 +631,17 @@ def main():
     failed = 0
     for fn in CASES:
         try:
-            fn()
+            checked = fn()
         except Exception:
             failed += 1
             print(f"ПРОВАЛ  {fn.__name__}")
             print("        " + traceback.format_exc().strip().replace("\n", "\n        "))
         else:
-            print(f"ок      {fn.__name__}")
+            # Проверки из матрицы возвращают, сколько клеток обошли. Без этого
+            # три строчки в отчёте выглядели бы как три проверки, хотя за ними
+            # стоит больше семисот.
+            print(f"ок      {fn.__name__}" + (f"  ({checked} клеток)"
+                                              if isinstance(checked, int) else ""))
 
     server.shutdown()
     # Гоняются они перед каждой сборкой, и каждый прогон оставлял в %TEMP%

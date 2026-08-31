@@ -164,7 +164,7 @@ def check_docs():
 def preflight():
     """Все проверки - до сборки. Раньше кодировка setup.nsi проверялась после
     двух прогонов PyInstaller, то есть через пару минут работы впустую."""
-    for name in ("gui.py", "core.py", "tests.py", "models.json",
+    for name in ("gui.py", "core.py", "tests.py", "tests_matrix.py", "models.json",
                  "icon.ico", "setup.nsi", "README.md", DOCS):
         if not (HERE / name).exists():
             sys.exit(f"не хватает файла {name}")

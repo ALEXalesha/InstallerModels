@@ -150,7 +150,7 @@
       "files": [
         {
           "name": "gemma-4-E2B-it-Q4_K_M.gguf",
-          "size": 3427877696
+          "size": 3427880384
         },
         {
           "name": "mmproj-gemma-4-E2B-it-BF16.gguf",

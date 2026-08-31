@@ -47,6 +47,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # Потолок с большим запасом: самая длинная честная проверка тут - докачка
     # кусками по 7000 байт, это 15 подходов.
     bound = 40
+    tree = []      # что отдаёт опись репозитория: список записей или код ошибки
+    pages = None   # пара страниц, когда проверяем постраничную выдачу
+    base = ""      # адрес самого макета, для ссылки на следующую страницу
 
     def log_message(self, *args):
         pass
@@ -54,6 +57,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         Handler.hits += 1
         Handler.seen = dict(self.headers)
+
+        # Опись репозитория для --sync-manifest. Отдаётся отдельной ручкой и
+        # к скачиванию отношения не имеет, поэтому и разбирается до режимов.
+        if self.path.startswith("/api/"):
+            self.send_listing()
+            return
 
         # Сломай в core.py счётчик перезапусков - и проверка на вечный круг
         # закрутится вечно сама. Это хуже проваленной проверки: build.py гоняет
@@ -103,6 +112,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             return
         self.wfile.write(BODY[start:])
+
+    def send_listing(self):
+        """Изображает api/models/РЕПО/tree/main. Что отдавать - в Handler.tree:
+        либо список записей, либо код ошибки, либо две страницы для проверки
+        постраничной выдачи."""
+        page = Handler.tree
+        if isinstance(page, int):
+            self.reply(page)
+            return
+        if Handler.pages and "page=2" not in self.path:
+            page, rest = Handler.pages
+            body = json.dumps(page).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Link", f'<{Handler.base}/api/x?page=2>; rel="next"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if Handler.pages and "page=2" in self.path:
+            page = Handler.pages[1]
+        body = json.dumps(page).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def reply(self, code, length=0, span=None):
         self.send_response(code)
@@ -461,6 +497,139 @@ def the_readme_links_to_docs_that_exist():
     assert links, "в README не осталось ссылок на docs/ - проверка потеряла смысл"
     missing = [link for link in links if not (HERE / link).exists()]
     assert not missing, f"README ссылается на то, чего нет: {missing}"
+
+
+def как_на_сервере(*files):
+    """Опись репозитория в том виде, в каком её отдаёт Hugging Face."""
+    return [{"type": "file", "path": path, "size": size, "oid": "0" * 40}
+            for path, size in files]
+
+
+SYNC_MANIFEST = {
+    "comfyui_root": "C:/ComfyUI",
+    "groups": {"g": {"title": "T", "files": [
+        {"dest": "models/vae/a.bin", "repo": "автор/репо", "path": "a.bin", "size": 100},
+        {"dest": "models/vae/b.bin", "repo": "автор/репо", "path": "sub/b.bin", "size": 200},
+    ]}},
+    "lmstudio": [{"search": "автор/gguf", "quant": "Q4_K_M",
+                  "files": [{"name": "m.gguf", "size": 300}]}],
+}
+
+
+@case
+def the_manifest_can_be_checked_against_the_server():
+    """Размеры добывались руками, по одному curl на файл, и оттого отставали.
+
+    Отставший размер - это не мелочь: скачивание падает с «manifest is out of
+    date» ещё до первого байта, и правильное число человек ищет сам. Опись
+    репозитория отдаётся одной ручкой, и в ней есть и размеры, и пути.
+    """
+    import copy
+
+    Handler.pages, Handler.hits = None, 0
+    Handler.tree = как_на_сервере(("a.bin", 100), ("sub/b.bin", 200), ("m.gguf", 300))
+    manifest = copy.deepcopy(SYNC_MANIFEST)
+    drifts = core.manifest_drift(manifest)
+    assert len(drifts) == 3, drifts
+    assert {d.state for d in drifts} == {"ok"}, drifts
+    # Один и тот же репозиторий у двух файлов - опись берётся один раз.
+    assert Handler.hits == 2, f"запросов {Handler.hits}, ждали по одному на репозиторий"
+
+    # Размер уехал: сверка это видит и правит, а вот исчезнувший путь не трогает -
+    # какой файл автор имел в виду, знает только человек.
+    Handler.tree, Handler.hits = как_на_сервере(("a.bin", 111), ("m.gguf", 300)), 0
+    manifest = copy.deepcopy(SYNC_MANIFEST)
+    drifts = core.manifest_drift(manifest)
+    по_месту = {d.dest: d for d in drifts}
+    assert по_месту["models/vae/a.bin"].state == "размер"
+    assert по_месту["models/vae/a.bin"].now == 111
+    assert по_месту["models/vae/b.bin"].state == "нет файла"
+    assert по_месту["m.gguf"].state == "ok", "раздел lmstudio тоже надо сверять"
+
+    assert core.apply_drift(manifest, drifts) == 1, "поправить надо было ровно один размер"
+    assert manifest["groups"]["g"]["files"][0]["size"] == 111
+    assert manifest["groups"]["g"]["files"][1]["size"] == 200, "исчезнувший путь трогать нельзя"
+
+
+@case
+def a_synced_manifest_stays_loadable_and_keeps_its_looks():
+    """Запись не должна ни ломать манифест, ни перелопачивать файл.
+
+    models.json правят руками, и diff после сверки обязан показывать только те
+    числа, которые изменились, - иначе понять, что натворила команда, нельзя.
+    """
+    import copy
+
+    path = TMP / "sync.json"
+    core.save_manifest(copy.deepcopy(SYNC_MANIFEST), path)
+    было = path.read_bytes()
+    assert было.endswith(b"\r\n"), "манифест пишется с CRLF, как все файлы проекта"
+    assert not было.startswith(b"\xef\xbb\xbf"), "у models.json BOM не было и не надо"
+
+    # Перезапись без единой правки обязана дать те же байты.
+    core.save_manifest(core.load_manifest(path), path)
+    assert path.read_bytes() == было, "запись без правок изменила файл"
+
+    # А теперь с правкой: меняется одно число, остальное на месте.
+    Handler.pages = None
+    Handler.tree = как_на_сервере(("a.bin", 999), ("sub/b.bin", 200), ("m.gguf", 300))
+    manifest = core.load_manifest(path)
+    core.apply_drift(manifest, core.manifest_drift(manifest))
+    core.check_manifest(manifest)      # то, что пишем, обязано проходить загрузку
+    core.save_manifest(manifest, path)
+    стало = path.read_bytes()
+    assert core.load_manifest(path)["groups"]["g"]["files"][0]["size"] == 999
+    разница = [(a, b) for a, b in zip(было.split(b"\r\n"), стало.split(b"\r\n")) if a != b]
+    assert len(разница) == 1, f"изменилось строк: {len(разница)} - {разница[:4]}"
+
+
+@case
+def a_closed_repo_does_not_sink_the_whole_check():
+    """Один закрытый репозиторий не должен мешать узнать про остальные.
+
+    Их в манифесте тринадцать. Если сверка падает на первом же недоступном,
+    человек не узнает ничего и про двенадцать оставшихся.
+    """
+    import copy
+
+    Handler.pages = None
+    for code, что_в_ответе in ((403, "HF_TOKEN"), (404, "models.json"), (500, "500")):
+        Handler.tree, Handler.hits = code, 0
+        manifest = copy.deepcopy(SYNC_MANIFEST)
+        drifts = core.manifest_drift(manifest)
+        assert {d.state for d in drifts} == {"репозиторий"}, drifts
+        assert что_в_ответе in drifts[0].now, drifts[0].now
+        # Причина у всех записей одна, и запрашивать репозиторий заново незачем.
+        assert Handler.hits == 2, f"запросов {Handler.hits}, ждали по одному на репозиторий"
+
+        # И править по такой сверке нечего. У недоступного репозитория в поле
+        # нового размера лежит текст ошибки, а не число: подставь его в манифест,
+        # и там окажется строка вместо размера. Загружаться он после этого
+        # перестанет, а узнается это уже при следующем запуске программы.
+        assert core.apply_drift(manifest, drifts) == 0, \
+            "по недоступному репозиторию правок быть не может"
+        core.check_manifest(manifest)
+
+
+@case
+def a_long_repo_listing_is_read_to_the_end():
+    """Опись длинного репозитория приходит страницами.
+
+    Прочитать только первую - и остальные файлы выглядели бы как «пропали»,
+    а сверка бодро посоветовала бы править пути, с которыми всё в порядке.
+    """
+    import copy
+
+    Handler.tree = []
+    Handler.base = URL.rsplit("/", 1)[0]
+    Handler.pages = (как_на_сервере(("a.bin", 100)),
+                     как_на_сервере(("sub/b.bin", 200), ("m.gguf", 300)))
+    try:
+        drifts = core.manifest_drift(copy.deepcopy(SYNC_MANIFEST))
+    finally:
+        Handler.pages = None
+    assert {d.state for d in drifts} == {"ok"}, \
+        f"вторая страница описи потерялась: {[(d.dest, d.state) for d in drifts]}"
 
 
 @case
@@ -1175,7 +1344,11 @@ def main():
 
     server = Server(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    URL = f"http://127.0.0.1:{server.server_address[1]}/model.safetensors"
+    порт = server.server_address[1]
+    URL = f"http://127.0.0.1:{порт}/model.safetensors"
+    # Сверка манифеста ходит на api/models/..., и без этой строки она пошла бы в
+    # настоящий Hugging Face. Проверкам сеть не нужна ни на байт.
+    core.HF_HOST = f"http://127.0.0.1:{порт}"
 
     failed = 0
     for fn in CASES:

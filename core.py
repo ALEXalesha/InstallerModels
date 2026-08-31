@@ -256,8 +256,148 @@ def comfy_root(manifest, override=None):
     return Path(root).expanduser()
 
 
+HF_HOST = "https://huggingface.co"
+
+
 def hf_url(repo, path):
-    return f"https://huggingface.co/{repo}/resolve/main/{quote(path)}"
+    return f"{HF_HOST}/{repo}/resolve/main/{quote(path)}"
+
+
+def api_url(repo):
+    """Опись репозитория. recursive - потому что пути в манифесте вложенные:
+    split_files/text_encoders/... без него вернулся бы только верхний уровень."""
+    return f"{HF_HOST}/api/models/{quote(repo)}/tree/main?recursive=1"
+
+
+def next_page(link_header):
+    """Hugging Face режет длинные описи на страницы и даёт ссылку в Link.
+    Без этого репозиторий на сотню файлов молча вернул бы первую сотню, а
+    остальные записи манифеста выглядели бы как «файла больше нет»."""
+    for part in (link_header or "").split(","):
+        chunk = part.split(";")
+        if len(chunk) >= 2 and 'rel="next"' in chunk[1].replace(" ", ""):
+            return chunk[0].strip().strip("<>")
+    return None
+
+
+def repo_listing(repo):
+    """Что сейчас лежит в репозитории: путь -> размер в байтах.
+
+    Один запрос на весь репозиторий, а не на файл: README до сих пор велел
+    добывать размеры руками, по одному curl на каждый, и оттого они и отставали.
+    Скачивать при этом ничего не надо - опись отдаётся отдельной ручкой.
+    """
+    found, url = {}, api_url(repo)
+    while url:
+        req = urllib.request.Request(url, headers={"User-Agent": "InstallerModels/1.0",
+                                                   "Accept-Encoding": "identity"})
+        token = hf_token()
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        try:
+            resp = urllib.request.urlopen(req, timeout=TIMEOUT)
+        except urllib.error.HTTPError as err:
+            if err.code in (401, 403):
+                raise RuntimeError(
+                    f"HTTP {err.code} - репозиторий закрыт или требует лицензии, "
+                    f"прими её на странице модели и положи токен в HF_TOKEN"
+                ) from None
+            if err.code == 404:
+                raise RuntimeError("репозиторий не найден, проверь repo в models.json") from None
+            raise RuntimeError(f"Hugging Face ответил {err.code}") from None
+        except NETWORK_ERRORS as err:
+            raise RuntimeError(f"нет связи с Hugging Face: {err}") from None
+        with resp:
+            try:
+                page = json.load(resp)
+            except ValueError as err:
+                raise RuntimeError(f"опись репозитория не разбирается: {err}") from None
+            url = next_page(resp.headers.get("Link"))
+        if not isinstance(page, list):
+            raise RuntimeError("опись репозитория пришла не списком")
+        for item in page:
+            # size у LFS-файлов - настоящий размер, а не размер указателя:
+            # проверено на sdxl_vae, сошлось с манифестом до байта.
+            if isinstance(item, dict) and item.get("type") == "file" \
+                    and isinstance(item.get("size"), int):
+                found[item["path"]] = item["size"]
+    return found
+
+
+# state: "ok" - сходится, "размер" - другой размер, "нет файла" - путь исчез,
+# "репозиторий" - до репозитория вообще не достучались (в now лежит причина).
+Drift = namedtuple("Drift", "group dest repo path state was now")
+
+
+def manifest_entries(manifest):
+    """Все записи манифеста единым списком: и группы, и раздел lmstudio.
+
+    У lmstudio файл лежит в корне репозитория и назван name, а не path - но
+    устаревать его размер может ровно так же, и вкладка окна складывает эти
+    числа в общий итог.
+    """
+    for name, group in manifest["groups"].items():
+        for entry in group["files"]:
+            yield name, entry["dest"], entry["repo"], entry["path"], entry["size"]
+    for model in manifest.get("lmstudio", []):
+        for item in model["files"]:
+            yield "lmstudio", item["name"], model["search"], item["name"], item["size"]
+
+
+def manifest_drift(manifest, listing=None):
+    """Сверяет каждую запись манифеста с тем, что сейчас на Hugging Face.
+
+    Описи репозиториев берутся по одному разу: один и тот же repo встречается в
+    манифесте до четырёх раз. Сорвавшийся репозиторий не роняет сверку целиком -
+    он становится обычной строкой отчёта, иначе один закрытый репозиторий не дал
+    бы узнать ничего про остальные двенадцать.
+    """
+    listing = listing or repo_listing
+    drifts, shelves = [], {}
+    for group, dest, repo, path, size in manifest_entries(manifest):
+        if repo not in shelves:
+            try:
+                shelves[repo] = listing(repo)
+            except RuntimeError as err:
+                shelves[repo] = err
+        shelf = shelves[repo]
+        if isinstance(shelf, RuntimeError):
+            drifts.append(Drift(group, dest, repo, path, "репозиторий", size, str(shelf)))
+            continue
+        now = shelf.get(path)
+        if now is None:
+            drifts.append(Drift(group, dest, repo, path, "нет файла", size, None))
+        elif now != size:
+            drifts.append(Drift(group, dest, repo, path, "размер", size, now))
+        else:
+            drifts.append(Drift(group, dest, repo, path, "ok", size, now))
+    return drifts
+
+
+def apply_drift(manifest, drifts):
+    """Проставляет новые размеры. Правит только их: путь, уехавший в никуда,
+    угадывать нельзя - какой файл автор имел в виду, знает только человек."""
+    fresh = {(d.group, d.dest): d.now for d in drifts if d.state == "размер"}
+    fixed = 0
+    for name, group in manifest["groups"].items():
+        for entry in group["files"]:
+            size = fresh.get((name, entry["dest"]))
+            if size is not None:
+                entry["size"], fixed = size, fixed + 1
+    for model in manifest.get("lmstudio", []):
+        for item in model["files"]:
+            size = fresh.get(("lmstudio", item["name"]))
+            if size is not None:
+                item["size"], fixed = size, fixed + 1
+    return fixed
+
+
+def save_manifest(manifest, path):
+    """Пишет models.json обратно так, как он был написан руками: два пробела,
+    кириллица как есть, CRLF как у всех файлов проекта. Проверено - на
+    неизменённом манифесте запись даёт те же байты, что и были."""
+    text = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+    Path(path).write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
 
 
 def part_path(dest):

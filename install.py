@@ -7,6 +7,8 @@ import sys
 
 from core import (
     Cancelled,
+    apply_drift,
+    check_manifest,
     comfy_root,
     dest_path,
     fetch,
@@ -15,8 +17,11 @@ from core import (
     hf_url,
     human,
     load_manifest,
+    manifest_drift,
+    manifest_path,
     needed_bytes,
     pending,
+    save_manifest,
     status,
     unique,
 )
@@ -117,6 +122,64 @@ def cmd_lmstudio(manifest):
         print()
 
 
+def cmd_sync(manifest, path, write):
+    """Сверяет размеры в models.json с тем, что сейчас на Hugging Face.
+
+    До сих пор размеры добывались руками, по одному curl на файл, и оттого
+    отставали: автор пересобрал модель - и скачивание падает с «manifest is out
+    of date», а чинить надо пятнадцать чисел вручную. Запросов идёт по одному на
+    репозиторий, а не на файл, и качать при этом ничего не надо.
+    """
+    print("сверяю models.json с Hugging Face...\n")
+    drifts = manifest_drift(manifest)
+
+    stale = [d for d in drifts if d.state == "размер"]
+    gone = [d for d in drifts if d.state == "нет файла"]
+    unreachable = [d for d in drifts if d.state == "репозиторий"]
+
+    for drift in stale:
+        print(f"  размер   {drift.dest}")
+        print(f"           в манифесте {drift.was}, на сервере {drift.now}")
+    for drift in gone:
+        print(f"  пропал   {drift.dest}")
+        print(f"           {drift.repo}/{drift.path} - файл переименовали или убрали")
+    # Один репозиторий на несколько файлов, и жаловаться на него столько же раз
+    # незачем: причина у всех одна.
+    for repo in dict.fromkeys(d.repo for d in unreachable):
+        why = next(d.now for d in unreachable if d.repo == repo)
+        print(f"  не вышло {repo}")
+        print(f"           {why}")
+
+    checked = len(drifts) - len(unreachable)
+    print(f"\nсверено записей: {checked} из {len(drifts)}")
+    if not (stale or gone or unreachable):
+        print("всё сходится, править нечего")
+        return 0
+
+    if unreachable:
+        # Записать половину и отчитаться «сверено» - худшее из возможного:
+        # человек решит, что манифест теперь верен целиком.
+        print("до части репозиториев не достучались, ничего не записываю")
+        return 1
+    if gone and not stale:
+        print("размеры в порядке, но пути устарели - их надо править руками")
+        return 1
+
+    if not write:
+        print(f"размеров с расхождением: {len(stale)}")
+        print("повтори с --write, чтобы вписать новые числа в models.json")
+        return 1
+
+    fixed = apply_drift(manifest, drifts)
+    check_manifest(manifest)   # что записываем, то и должно проходить загрузку
+    save_manifest(manifest, path)
+    print(f"вписано новых размеров: {fixed}")
+    if gone:
+        print("пути, которых больше нет, не тронуты - их надо править руками")
+        return 1
+    return 0
+
+
 def cmd_install(manifest, root, keys, dry_run):
     queue = pending(manifest, keys, root)
     wanted = {e["dest"] for e in queue}
@@ -209,6 +272,10 @@ def main():
     parser.add_argument("--list", action="store_true", help="show groups and sizes")
     parser.add_argument("--check", action="store_true", help="verify what is on disk")
     parser.add_argument("--lmstudio", action="store_true", help="show LM Studio model names")
+    parser.add_argument("--sync-manifest", action="store_true",
+                        help="check sizes in models.json against Hugging Face")
+    parser.add_argument("--write", action="store_true",
+                        help="with --sync-manifest: write the new sizes into models.json")
     parser.add_argument("--dry-run", action="store_true", help="show what would download")
     parser.add_argument("--root",
                         help="ComfyUI folder (beats COMFYUI_ROOT, the remembered "
@@ -218,6 +285,14 @@ def main():
     if args.lmstudio:
         cmd_lmstudio(manifest)
         return 0
+
+    # Сверка смотрит только в сеть и в сам манифест: папка ComfyUI ей не нужна,
+    # так что и не требуем её - чинить манифест можно и не имея моделей.
+    if args.sync_manifest:
+        return cmd_sync(manifest, manifest_path(), args.write)
+    if args.write:
+        print("--write работает только вместе с --sync-manifest")
+        return 1
 
     root = comfy_root(manifest, args.root)
 

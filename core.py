@@ -689,6 +689,35 @@ class Digest:
         return None if got == self.want else got
 
 
+def file_sha256(path, on_progress=None, should_stop=None):
+    """Считает sha256 у файла, который уже лежит на диске.
+
+    Сумма из манифеста сверяется в момент скачивания, а у файлов, скачанных
+    раньше, её не проверял никто и никогда. Порча диска - ровно тот случай,
+    ради которого суммы и заводят, и заметить её можно только пройдя по файлам.
+
+    Дорого: это чтение всего файла. Оттого и отдельной командой, а не внутри
+    --check, который бегает по размерам за долю секунды.
+    """
+    path = Path(path)
+    total = path.stat().st_size
+    digest = hashlib.sha256()
+    done, started = 0, time.monotonic()
+    with open(path, "rb") as fh:
+        while True:
+            if should_stop and should_stop():
+                raise Cancelled
+            block = fh.read(CHUNK)
+            if not block:
+                break
+            digest.update(block)
+            done += len(block)
+            if on_progress:
+                elapsed = max(time.monotonic() - started, 1e-6)
+                on_progress(done, total, done / elapsed)
+    return digest.hexdigest()
+
+
 NO_SPACE = {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}
 
 

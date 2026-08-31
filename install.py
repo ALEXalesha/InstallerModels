@@ -13,6 +13,7 @@ from core import (
     comfy_root,
     dest_path,
     fetch,
+    file_sha256,
     group_size,
     group_state,
     hf_url,
@@ -190,6 +191,70 @@ def cmd_sync(manifest, path, write):
     return 0
 
 
+def cmd_verify(manifest, root, keys=None):
+    """Пересчитывает sha256 у того, что уже лежит на диске.
+
+    Сумма сверяется в момент скачивания, но у файлов, скачанных раньше, её не
+    проверял никто. Между тем порча диска - ровно тот случай, ради которого
+    суммы и заводят, и заметна она только так.
+
+    Отдельной командой, а не внутри --check: тот бегает по размерам за долю
+    секунды, а этот читает все 95 ГиБ и займёт минут двадцать.
+    """
+    bad = incomplete = unchecked = 0
+    for key in keys or list(manifest["groups"]):
+        group = manifest["groups"][key]
+        print(f"\n{key} - {group['title']}")
+        for entry in group["files"]:
+            state, actual = status(entry, root)
+            if state != "ok":
+                # Не дочитано или не дошло - считать сумму не по чему, и это
+                # забота --check, а не наша. Но промолчать тоже нельзя.
+                print(f"  {MARK_WORD[state]:<9} {entry['dest']}")
+                incomplete += 1
+                continue
+            want = entry.get("sha256")
+            if not want:
+                print(f"  нет суммы {entry['dest']}")
+                unchecked += 1
+                continue
+
+            print(f"  считаю    {entry['dest']}  ({human(entry['size'])})")
+            bar = Progress()
+            try:
+                got = file_sha256(dest_path(root, entry["dest"]), on_progress=bar.update)
+            except (Cancelled, KeyboardInterrupt):
+                bar.finish()
+                raise KeyboardInterrupt
+            except OSError as err:
+                bar.finish()
+                print(f"  НЕ ПРОЧЁЛ {entry['dest']}: {err}")
+                bad += 1
+                continue
+            bar.finish()
+            if got == want.lower():
+                print(f"  ok        {entry['dest']}")
+            else:
+                print(f"  БИТЫЙ     {entry['dest']}")
+                print(f"            в models.json {want}")
+                print(f"            на диске      {got}")
+                bad += 1
+
+    print()
+    if unchecked:
+        print(f"без суммы в models.json: {unchecked} - проверить их нечем, "
+              f"загляни в --sync-manifest")
+    if incomplete:
+        print(f"не скачано целиком: {incomplete}")
+    if bad:
+        print(f"БИТЫХ ФАЙЛОВ: {bad}")
+        print("удали их и запусти установку заново - размер у них верный, "
+              "так что сами по себе они не перекачаются")
+    elif not incomplete:
+        print("всё, что можно было проверить, сошлось побайтно")
+    return 1 if (bad or incomplete) else 0
+
+
 def cmd_install(manifest, root, keys, dry_run):
     queue = pending(manifest, keys, root)
     wanted = {e["dest"] for e in queue}
@@ -282,6 +347,8 @@ def main():
     parser.add_argument("--all", action="store_true", help="install every group")
     parser.add_argument("--list", action="store_true", help="show groups and sizes")
     parser.add_argument("--check", action="store_true", help="verify what is on disk")
+    parser.add_argument("--verify", action="store_true",
+                        help="recompute sha256 of downloaded files (slow, reads them all)")
     parser.add_argument("--lmstudio", action="store_true", help="show LM Studio model names")
     parser.add_argument("--sync-manifest", action="store_true",
                         help="check sizes in models.json against Hugging Face")
@@ -307,7 +374,7 @@ def main():
 
     root = comfy_root(manifest, args.root)
 
-    if args.list or not (args.groups or args.all or args.check):
+    if args.list or not (args.groups or args.all or args.check or args.verify):
         cmd_list(manifest, root)
         if not args.list:
             print("\nusage:  python install.py ltx qwen   |   python install.py --all")
@@ -329,6 +396,9 @@ def main():
 
     if args.check:
         return cmd_check(manifest, root, keys)
+
+    if args.verify:
+        return cmd_verify(manifest, root, keys)
 
     return cmd_install(manifest, root, keys, args.dry_run)
 

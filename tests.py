@@ -1073,6 +1073,9 @@ def the_command_line_answers_every_flag():
         (["--check"],            1, ["sdxl", "hunyuan3d", "need downloading"], []),
         (["--check", "sdxl"],    1, ["sdxl"],                             ["hunyuan3d"]),
         (["--check", "ltxx"],    1, ["unknown group"],                    []),
+        # Ничего не скачано, так что считать нечего - но команда обязана
+        # отработать, а не свалиться на первом же отсутствующем файле.
+        (["--verify", "sdxl"],   1, ["не скачано целиком"],               ["БИТЫХ"]),
         (["--dry-run", "sdxl"],  0, ["to download", "sdxl_vae"],          []),
         (["нетакой"],            1, ["unknown group", "available:"],      []),
         (["--root", str(TMP / "нет-папки"), "sdxl"], 1, ["folder not found"], []),
@@ -1231,6 +1234,116 @@ def the_sync_command_reports_and_refuses_in_the_right_order():
     нетронутый = core.load_manifest(путь)
     assert "sha256" not in нетронутый["groups"]["g"]["files"][0], \
         "при недоступном репозитории записано быть ничего не должно"
+
+
+@case
+def verify_catches_rot_that_size_cannot_see():
+    """Сумма сверялась только в момент скачивания.
+
+    У человека, у которого 95 ГиБ уже лежат с прошлого месяца, способа их
+    проверить не было никакого: --check смотрит на размер, а размер у побитого
+    диском файла тот же самый. Порча диска - ровно тот случай, ради которого
+    суммы и заводят, и заметить её можно только пройдя по файлам.
+    """
+    import contextlib
+    import hashlib
+    import io
+
+    import install
+
+    root = TMP / "verify-root"
+    (root / "models/vae").mkdir(parents=True, exist_ok=True)
+    целый, битый, безсуммы = (root / "models/vae/целый.bin",
+                              root / "models/vae/битый.bin",
+                              root / "models/vae/безсуммы.bin")
+    for path in (целый, битый, безсуммы):
+        path.write_bytes(BODY)
+    # Тот же размер, другое содержимое - ровно то, чего размер не видит.
+    битый.write_bytes(bytes(SIZE))
+
+    сумма = hashlib.sha256(BODY).hexdigest()
+    manifest = {"comfyui_root": str(root), "groups": {"g": {"title": "T", "files": [
+        {"dest": "models/vae/целый.bin", "repo": "r", "path": "p",
+         "size": SIZE, "sha256": сумма},
+        {"dest": "models/vae/битый.bin", "repo": "r", "path": "p",
+         "size": SIZE, "sha256": сумма},
+        {"dest": "models/vae/безсуммы.bin", "repo": "r", "path": "p", "size": SIZE},
+        {"dest": "models/vae/нету.bin", "repo": "r", "path": "p",
+         "size": SIZE, "sha256": сумма},
+    ]}}}
+    core.check_manifest(manifest)
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = install.cmd_verify(manifest, root)
+    text = out.getvalue()
+
+    assert code == 1, text
+    assert "ok        models/vae/целый.bin" in text, text
+    assert "БИТЫЙ     models/vae/битый.bin" in text, text
+    assert сумма in text, "в отчёте нет того, что ожидалось"
+    assert "нет суммы models/vae/безсуммы.bin" in text, text
+    assert "missing   models/vae/нету.bin" in text, text
+    assert "БИТЫХ ФАЙЛОВ: 1" in text, text
+    # Битый файл сам по себе не перекачается: размер у него верный, и
+    # --install его пропустит как готовый. Об этом надо сказать прямо.
+    assert "размер у них верный" in text, text
+
+    # Всё цело - и это отдельный исход, а не отсутствие жалоб.
+    целиком = {"comfyui_root": str(root), "groups": {"g": {"title": "T", "files": [
+        {"dest": "models/vae/целый.bin", "repo": "r", "path": "p",
+         "size": SIZE, "sha256": сумма.upper()},   # регистр значения не имеет
+    ]}}}
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = install.cmd_verify(целиком, root)
+    assert code == 0 and "сошлось побайтно" in out.getvalue(), out.getvalue()
+
+
+@case
+def the_checks_never_touch_the_real_settings():
+    """Прогон обязан быть безвредным для машины, на которой идёт.
+
+    Он таким не был: проверка окна дёргает apply_typed_root(), тот зовёт
+    remember_root(), и запомненная папка ComfyUI уезжала в настоящий
+    %LOCALAPPDATA%. Каждый прогон молча переставлял человеку путь к моделям на
+    временную папку, которую сам же потом и стирал, - а при следующем запуске
+    программа говорила «папка не найдена», и виноватой выглядела она.
+
+    Сторожим не место записи, а то, что оно уведено в песочницу: LOCALAPPDATA
+    на весь прогон смотрит в TMP. Забыть подмену в новой проверке слишком
+    легко, а заметно это станет не тут, а через неделю у человека.
+    """
+    песочница = core.settings_path()
+    assert TMP in песочница.parents, \
+        f"настройки пишутся мимо песочницы, в {песочница} - прогон портит машину"
+
+    # И запись туда действительно доходит, иначе сторож охранял бы пустоту.
+    core.remember_root("D:/Проверочная")
+    assert core.saved_root() == "D:/Проверочная"
+    assert песочница.is_file()
+
+
+@case
+def hashing_a_file_on_disk_reports_progress():
+    """Чтение 95 ГиБ идёт минут двадцать, и молчать всё это время нельзя."""
+    path = TMP / "hash-me.bin"
+    path.write_bytes(BODY)
+    шаги = []
+    import hashlib
+    got = core.file_sha256(path, on_progress=lambda d, t, s: шаги.append((d, t, s)))
+    assert got == hashlib.sha256(BODY).hexdigest()
+    assert шаги, "ни одного шага прогресса"
+    assert шаги[-1][0] == шаги[-1][1] == SIZE, шаги[-1]
+    assert all(s >= 0 for _, _, s in шаги), "скорость ушла в минус"
+
+    # Отмена обязана всплывать наверх, а не возвращать полусумму.
+    try:
+        core.file_sha256(path, should_stop=lambda: True)
+    except core.Cancelled:
+        pass
+    else:
+        raise AssertionError("отмена обязана была всплыть")
 
 
 @case
@@ -1733,6 +1846,21 @@ def main():
     global URL
     core.wait_before_retry = lambda seconds, should_stop: None  # не ждём по пять секунд
 
+    # Настройки уводим в песочницу на весь прогон.
+    #
+    # Это не предосторожность на будущее, а починка: проверка окна дёргает
+    # apply_typed_root(), тот честно зовёт remember_root(), и запомненная папка
+    # ComfyUI уезжала в НАСТОЯЩИЙ %LOCALAPPDATA%\InstallerModels\settings.json.
+    # То есть каждый прогон проверок молча переставлял человеку путь к моделям -
+    # на временную папку, которую сам же потом и стирал. При следующем запуске
+    # программа показывала "папка не найдена", и виноватой выглядела она.
+    #
+    # Отдельные проверки подменяли LOCALAPPDATA сами, но полагаться на это
+    # нельзя: забыть подмену в новой проверке слишком легко, а заметно это
+    # станет не в прогоне, а через неделю у человека.
+    было_appdata = os.environ.get("LOCALAPPDATA")
+    os.environ["LOCALAPPDATA"] = str(TMP / "appdata")
+
     server = Server(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     порт = server.server_address[1]
@@ -1757,6 +1885,10 @@ def main():
                                               if isinstance(checked, int) else ""))
 
     server.shutdown()
+    if было_appdata is None:
+        os.environ.pop("LOCALAPPDATA", None)
+    else:
+        os.environ["LOCALAPPDATA"] = было_appdata
     # Гоняются они перед каждой сборкой, и каждый прогон оставлял в %TEMP%
     # папку на сотню килобайт. За полгода это заметная куча ни для кого.
     shutil.rmtree(TMP, ignore_errors=True)

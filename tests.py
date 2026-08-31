@@ -464,27 +464,61 @@ def the_readme_links_to_docs_that_exist():
 
 
 @case
-def window_title_matches_the_installer():
-    """Установщик ищет запущенную программу через FindWindow по заголовку окна.
-    Разъедутся строки - он молча начнёт затирать файлы под работающей программой."""
-    import re
-    in_gui = re.search(r'window\.title\("([^"]*)"\)', (HERE / "gui.py").read_text(encoding="utf-8"))
-    in_nsi = re.search(r'!define WINTITLE "([^"]*)"',
-                       (HERE / "setup.nsi").read_text(encoding="utf-8-sig"))
-    assert in_gui and in_nsi, "не нашёл заголовок в gui.py или setup.nsi"
-    assert in_gui.group(1) == in_nsi.group(1), f"{in_gui.group(1)!r} != {in_nsi.group(1)!r}"
+def one_source_for_the_name_version_and_title():
+    """Имя, версия и заголовок окна записаны ровно один раз - в core.py.
 
+    Раньше версия жила в трёх местах (build.py, !define в setup.nsi и команда в
+    его же шапке), заголовок окна в двух, имя программы в трёх. За тем, чтобы
+    копии не разъехались, следили четыре отдельные проверки, и каждая из них
+    появилась после того, как копии таки разъехались. Проверка вида «A совпадает
+    с B» - это симптом: один и тот же факт записан дважды.
 
-@case
-def versions_match_everywhere():
+    Проверки сравнения теперь не нужны и убраны. Вместо них одна, сторожащая не
+    совпадение копий, а само их появление: дубли имеют свойство возвращаться -
+    подключаемого файла не оказалось под рукой, человек дописал !define прямо в
+    setup.nsi, и всё снова работает, молча и мимо core.py.
+    """
     import re
-    in_build = re.search(r'VERSION = "([^"]*)"', (HERE / "build.py").read_text(encoding="utf-8"))
+
+    import build
+
+    исходники = ["core.py", "gui.py", "install.py", "build.py", "tests.py",
+                 "tests_matrix.py", "setup.nsi"]
+    for name in исходники:
+        text = (HERE / name).read_text(encoding="utf-8-sig")
+        # Заголовок окна core.py собирает из APP, так что целиком строка не
+        # встречается нигде, включая сам core.py.
+        assert core.WINDOW_TITLE not in text, f"{name}: заголовок окна записан строкой"
+        if name != "core.py":
+            assert f'"{core.VERSION}"' not in text, f"{name}: версия записана строкой"
+
     text = (HERE / "setup.nsi").read_text(encoding="utf-8-sig")
-    in_nsi = re.search(r'!define VERSION "([^"]*)"', text)
-    assert in_build and in_nsi, "не нашёл версию в build.py или setup.nsi"
-    assert in_build.group(1) == in_nsi.group(1), f"{in_build.group(1)} != {in_nsi.group(1)}"
-    assert f"/DVERSION={in_build.group(1)} setup.nsi" in text, \
-        "команда для ручной сборки в шапке setup.nsi осталась на старой версии"
+    for name in ("APP", "VERSION", "WINTITLE"):
+        assert not re.search(rf"^\s*!define\s+{name}\b", text, re.M), \
+            f"setup.nsi объявляет {name} сам, а должен брать из version.nsh"
+    assert '!include "version.nsh"' in text, "setup.nsi не подключает version.nsh"
+
+    # Сам порождаемый файл: три строки, значения из core.py, и обязательно BOM -
+    # без него makensis прочтёт кириллицу в заголовке как ANSI и испортит её,
+    # а установщик перестанет находить запущенную программу.
+    где = TMP / "nsh"
+    где.mkdir(exist_ok=True)
+    было = build.HERE
+    try:
+        build.HERE = где
+        путь = build.write_nsis_defines()
+    finally:
+        build.HERE = было
+    raw = путь.read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf"), "version.nsh без BOM, кириллица испортится"
+    body = raw.decode("utf-8-sig")
+    assert f'!define APP "{core.APP}"' in body, body
+    assert f'!define VERSION "{core.VERSION}"' in body, body
+    assert f'!define WINTITLE "{core.WINDOW_TITLE}"' in body, body
+
+    # Окно ставит себе тот же заголовок, который уезжает в установщик.
+    assert "window.title(WINDOW_TITLE)" in (HERE / "gui.py").read_text(encoding="utf-8"), \
+        "окно берёт заголовок не из core.WINDOW_TITLE"
 
 
 @case
@@ -853,9 +887,9 @@ def the_build_refuses_a_broken_project():
     было = build.HERE
     try:
         build.HERE = good
+        build.write_nsis_defines()   # его же кладёт preflight перед проверками
         for check in (build.check_docs, build.check_nsi_encoding,
-                      build.check_window_title, build.check_version,
-                      build.check_manifest):
+                      build.check_nsi_has_no_copies, build.check_manifest):
             check()   # на целом проекте все обязаны молчать
 
         def без_title_ru(raw):
@@ -874,13 +908,15 @@ def the_build_refuses_a_broken_project():
              build.check_docs, "ссылка из README в никуда"),
             ("setup.nsi", lambda raw: raw[3:],
              build.check_nsi_encoding, "у setup.nsi отняли BOM"),
+            ("version.nsh", lambda raw: raw[3:],
+             build.check_nsi_encoding, "у version.nsh отняли BOM"),
             ("setup.nsi", lambda raw: raw.replace(
-                f'!define VERSION "{build.VERSION}"'.encode("utf-8"),
-                b'!define VERSION "0.0.0"'),
-             build.check_version, "версии разъехались"),
-            ("gui.py", lambda raw: raw.replace(
-                b'window.title("', b'window.title("\xd0\xa7\xd1\x83\xd0\xb6\xd0\xbe\xd0\xb5 '),
-             build.check_window_title, "заголовок окна разъехался с установщиком"),
+                b'!define PUBLISH', b'!define VERSION "0.0.0"\r\n!define PUBLISH'),
+             build.check_nsi_has_no_copies, "версию снова вписали в setup.nsi"),
+            ("setup.nsi", lambda raw: raw.replace(
+                b'!define PUBLISH', b'!define WINTITLE "\xd0\xa7\xd1\x83\xd0\xb6\xd0\xbe\xd0\xb5"'
+                                    b'\r\n!define PUBLISH'),
+             build.check_nsi_has_no_copies, "заголовок окна снова вписали в setup.nsi"),
             ("models.json", без_title_ru, build.check_manifest, "у групп нет title_ru"),
             ("models.json", без_lmstudio, build.check_manifest, "пропал раздел lmstudio"),
         ]
@@ -1103,7 +1139,9 @@ def the_installer_script_holds_together():
     # по жёстко записанному пути. Поменяется settings_path() в core.py - файл
     # переживёт удаление и всплывёт при следующей установке как чужая настройка.
     # Обе стороны выводим, а не вписываем: иначе проверка сама и разъедется.
-    app = regex.search(r'!define APP\s+"([^"]*)"', text).group(1)
+    # Имя берём из core.py: в setup.nsi его больше нет, оно приходит туда через
+    # version.nsh - из той же константы, что и settings_path().
+    app = core.APP
     было = os.environ.get("LOCALAPPDATA")
     os.environ["LOCALAPPDATA"] = "C:/AppData"
     try:

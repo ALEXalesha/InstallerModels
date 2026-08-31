@@ -3,3 +3,4 @@ __pycache__/
 *.part
 build/
 dist/
+version.nsh

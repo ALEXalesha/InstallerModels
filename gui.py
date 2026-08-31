@@ -12,6 +12,7 @@ from tkinter import filedialog, messagebox, ttk
 from core import (
     Cancelled,
     QueueProgress,
+    WINDOW_TITLE,
     app_dir,
     comfy_root,
     dest_path,
@@ -558,8 +559,10 @@ def main():
     enable_dpi_awareness()
     window = tk.Tk()
     # Заголовок ищет установщик через FindWindow, чтобы не сносить запущенную
-    # программу. Меняешь тут - поменяй WINTITLE в setup.nsi.
-    window.title("InstallerModels - модели для ComfyUI")
+    # программу. Строка одна на обоих: отсюда она же уезжает в version.nsh,
+    # который build.py кладёт рядом с setup.nsi. Раньше её надо было править в
+    # двух местах, и за этим следила отдельная проверка.
+    window.title(WINDOW_TITLE)
     window.geometry("880x720")
     window.minsize(720, 560)
     for folder in (app_dir(), Path(getattr(sys, "_MEIPASS", app_dir()))):

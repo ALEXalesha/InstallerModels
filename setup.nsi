@@ -1,13 +1,17 @@
 ﻿; Установщик InstallerModels. Ставит для текущего пользователя, без прав администратора.
-; Собирается из build.py, вручную: makensis /DVERSION=1.0.5 setup.nsi
+;
+; Собирать через build.py. Вручную - makensis setup.nsi, но только после того,
+; как build.py хоть раз положил рядом version.nsh: имя, версия и заголовок окна
+; приходят оттуда, а туда - из констант в core.py. Раньше версия была записана
+; и здесь, и в build.py, и в этой самой строке комментария, а заголовок окна -
+; здесь и в gui.py. За тем, чтобы копии не разъехались, следили четыре отдельные
+; проверки. Проверка вида «A совпадает с B» - это симптом: один и тот же факт
+; записан дважды.
 
 Unicode true
 
-!ifndef VERSION
-  !define VERSION "1.0.5"
-!endif
+!include "version.nsh"   ; APP, VERSION, WINTITLE - создаётся build.py
 
-!define APP     "InstallerModels"
 !define PUBLISH "ALEXaloysha"
 !define REGKEY  "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP}"
 
@@ -49,10 +53,10 @@ VIAddVersionKey "LegalCopyright" "${PUBLISH}"
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "Russian"
 
-; Ищем окно программы по заголовку. Это надёжнее проверки блокировки файла:
+; Окно программы ищем по заголовку. Это надёжнее проверки блокировки файла:
 ; работает и в деинсталляторе, который запускается копией из %TEMP% и видит
-; другой $INSTDIR. Заголовок должен совпадать с window.title() в gui.py.
-!define WINTITLE "InstallerModels - модели для ComfyUI"
+; другой $INSTDIR. Сам заголовок (WINTITLE) приходит из version.nsh, то есть
+; из той же строки в core.py, которую окно ставит себе при запуске.
 
 !macro RunningCheck un
 Function ${un}CheckNotRunning

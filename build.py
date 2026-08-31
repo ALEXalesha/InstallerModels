@@ -8,22 +8,21 @@ import subprocess
 import sys
 from pathlib import Path
 
+from core import APP, VERSION, WINDOW_TITLE
 from core import check_manifest as check_manifest_shape
 
 HERE = Path(__file__).resolve().parent
 DIST = HERE / "dist"
 WORK = HERE / "build"
-APP = "InstallerModels"
-VERSION = "1.0.5"
+
+# Имя, версия и заголовок окна приходят из core.py и больше ниоткуда.
+# Для NSIS они кладутся вот сюда - он читать Python не умеет.
+NSH = "version.nsh"
 
 # README ссылается на docs/ и показывает оттуда же скриншоты. Рядом с exe этой
 # папки не было ни разу: у человека, который поставил программу установщиком,
 # половина ссылок в README вела в пустоту, а картинки не открывались вовсе.
 DOCS = "docs"
-
-TITLE_IN_GUI = r'window\.title\("([^"]*)"\)'
-TITLE_IN_NSI = r'!define WINTITLE "([^"]*)"'
-VERSION_IN_NSI = r'!define VERSION "([^"]*)"'
 
 NSIS_CANDIDATES = [
     Path(r"C:\Program Files (x86)\NSIS\makensis.exe"),
@@ -70,39 +69,53 @@ def find_nsis():
 
 def check_nsi_encoding():
     """Без BOM makensis читает файл как ANSI и молча портит всю кириллицу,
-    включая заголовок окна, по которому установщик ищет запущенную программу."""
-    if not (HERE / "setup.nsi").read_bytes().startswith(b"\xef\xbb\xbf"):
-        sys.exit("setup.nsi должен быть в UTF-8 с BOM, иначе кириллица испортится")
+    включая заголовок окна, по которому установщик ищет запущенную программу.
+    Касается и подключаемого version.nsh: заголовок окна лежит именно в нём."""
+    for name in ("setup.nsi", NSH):
+        if not (HERE / name).read_bytes().startswith(b"\xef\xbb\xbf"):
+            sys.exit(f"{name} должен быть в UTF-8 с BOM, иначе кириллица испортится")
 
 
-def check_window_title():
-    """Установщик ищет запущенную программу через FindWindow по заголовку окна.
-    Разъедутся строки - он молча перестанет её находить и начнёт затирать файлы
-    под работающей программой. В обоих файлах об этом написано предупреждение,
-    но до сих пор ничто не мешало поправить одну строку и забыть про вторую."""
-    in_gui = re.search(TITLE_IN_GUI, (HERE / "gui.py").read_text(encoding="utf-8"))
-    in_nsi = re.search(TITLE_IN_NSI, (HERE / "setup.nsi").read_text(encoding="utf-8-sig"))
-    if not in_gui or not in_nsi:
-        sys.exit("не нашёл window.title() в gui.py или WINTITLE в setup.nsi")
-    if in_gui.group(1) != in_nsi.group(1):
-        sys.exit(
-            "заголовок окна разъехался, установщик не найдёт запущенную программу:"
-            f"\n  gui.py:    {in_gui.group(1)}"
-            f"\n  setup.nsi: {in_nsi.group(1)}"
-        )
+def write_nsis_defines():
+    """Кладёт рядом с setup.nsi три строки из core.py.
+
+    Это и есть вся уборка дублей: NSIS читать Python не умеет, но умеет
+    !include, а build.py умеет писать файлы. Раньше вместо этого версия жила в
+    трёх местах, заголовок окна в двух, и за их совпадением следили отдельные
+    проверки - каждая заведена после того, как копии таки разъехались.
+
+    BOM обязателен: в режиме Unicode makensis определяет кодировку по нему, а в
+    заголовке окна кириллица. Без BOM она превратится в мусор, установщик
+    перестанет находить запущенную программу и начнёт затирать файлы под ней.
+    """
+    body = "\n".join([
+        "; Этот файл создаёт build.py из констант в core.py.",
+        "; Руками не править - перезапишется при следующей сборке.",
+        f'!define APP "{APP}"',
+        f'!define VERSION "{VERSION}"',
+        f'!define WINTITLE "{WINDOW_TITLE}"',
+        "",
+    ])
+    path = HERE / NSH
+    path.write_bytes(b"\xef\xbb\xbf" + body.replace("\n", "\r\n").encode("utf-8"))
+    return path
 
 
-def check_version():
-    """setup.nsi собирают и руками, по строке из комментария в его шапке. Тогда
-    сработает !ifndef и версия возьмётся оттуда, а не отсюда. Разъедутся - и
-    установщик выйдет с чужим номером в «Программах и компонентах»."""
-    found = re.search(VERSION_IN_NSI, (HERE / "setup.nsi").read_text(encoding="utf-8-sig"))
-    if not found or found.group(1) != VERSION:
-        sys.exit(
-            "версия разъехалась:"
-            f"\n  build.py:  {VERSION}"
-            f"\n  setup.nsi: {found.group(1) if found else 'нет !define VERSION'}"
-        )
+def check_nsi_has_no_copies():
+    """setup.nsi не должен объявлять эти три штуки сам.
+
+    Дубли имеют свойство возвращаться: подключаемого файла под рукой не
+    оказалось, человек дописал !define прямо в setup.nsi - и всё снова работает,
+    молча и мимо core.py. Проверка сторожит не совпадение копий, а само их
+    появление.
+    """
+    text = (HERE / "setup.nsi").read_text(encoding="utf-8-sig")
+    for name in ("APP", "VERSION", "WINTITLE"):
+        if re.search(rf"^\s*!define\s+{name}\b", text, re.M):
+            sys.exit(
+                f"setup.nsi объявляет {name} сам, хотя должен брать его из {NSH}. "
+                f"Единственный источник - константы в core.py."
+            )
 
 
 def check_tests():
@@ -170,9 +183,11 @@ def preflight():
             sys.exit(f"не хватает файла {name}")
     check_docs()
     check_manifest()
+    # Сначала кладём version.nsh, потом проверяем кодировку обоих файлов:
+    # без него setup.nsi не соберётся, а проверять нечего.
+    write_nsis_defines()
     check_nsi_encoding()
-    check_window_title()
-    check_version()
+    check_nsi_has_no_copies()
     check_tests()
     check_pyinstaller()
 
@@ -218,7 +233,9 @@ def main():
 
     nsis = find_nsis()
     if nsis:
-        run([str(nsis), f"/DVERSION={VERSION}", str(HERE / "setup.nsi")], "NSIS")
+        # Ключа /DVERSION больше нет: имя, версия и заголовок приходят из
+        # version.nsh, который положил preflight.
+        run([str(nsis), str(HERE / "setup.nsi")], "NSIS")
     else:
         print("\nNSIS не найден, установщик не собран. Portable готов.")
 

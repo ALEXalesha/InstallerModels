@@ -2,6 +2,7 @@
 """Restore ComfyUI models from Hugging Face. Command line front end."""
 
 import argparse
+import copy
 import shutil
 import sys
 
@@ -152,7 +153,12 @@ def cmd_sync(manifest, path, write):
 
     checked = len(drifts) - len(unreachable)
     print(f"\nсверено записей: {checked} из {len(drifts)}")
-    if not (stale or gone or unreachable):
+
+    # Сколько всего изменится - считаем на копии: решение записывать ещё не
+    # принято, а трогать настоящий манифест до него нельзя.
+    можно = apply_drift(copy.deepcopy(manifest), drifts)
+
+    if not (stale or gone or unreachable or можно.hashes):
         print("всё сходится, править нечего")
         return 0
 
@@ -161,19 +167,23 @@ def cmd_sync(manifest, path, write):
         # человек решит, что манифест теперь верен целиком.
         print("до части репозиториев не достучались, ничего не записываю")
         return 1
-    if gone and not stale:
+
+    if можно.hashes:
+        print(f"контрольных сумм можно добавить: {можно.hashes}")
+    if gone and not (stale or можно.hashes):
         print("размеры в порядке, но пути устарели - их надо править руками")
         return 1
 
     if not write:
-        print(f"размеров с расхождением: {len(stale)}")
-        print("повтори с --write, чтобы вписать новые числа в models.json")
+        if stale:
+            print(f"размеров с расхождением: {len(stale)}")
+        print("повтори с --write, чтобы вписать это в models.json")
         return 1
 
-    fixed = apply_drift(manifest, drifts)
+    сделано = apply_drift(manifest, drifts)
     check_manifest(manifest)   # что записываем, то и должно проходить загрузку
     save_manifest(manifest, path)
-    print(f"вписано новых размеров: {fixed}")
+    print(f"вписано: размеров {сделано.sizes}, контрольных сумм {сделано.hashes}")
     if gone:
         print("пути, которых больше нет, не тронуты - их надо править руками")
         return 1
@@ -227,6 +237,7 @@ def cmd_install(manifest, root, keys, dry_run):
                 hf_url(entry["repo"], entry["path"]),
                 dest_path(root, entry["dest"]),
                 entry["size"],
+                sha256=entry.get("sha256"),
                 on_progress=bar.update,
                 on_note=lambda text: print(f"\n  {text}"),
             )

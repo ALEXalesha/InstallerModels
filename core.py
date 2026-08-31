@@ -1,6 +1,7 @@
 """Shared logic for the CLI and the GUI: manifest, sizes, resumable download."""
 
 import errno
+import hashlib
 import http.client
 import json
 import os
@@ -144,6 +145,23 @@ def need_size(where, entry):
     return size
 
 
+HEX = set("0123456789abcdefABCDEF")
+
+
+def need_hash(where, entry):
+    """sha256 необязателен - без него всё работает как раньше. Но если он есть,
+    он обязан быть настоящим: обрезанная или сбитая строка не поймает ни одной
+    поломки, зато завалит закачку целого файла."""
+    value = entry.get("sha256")
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) != 64 or set(value) - HEX:
+        raise ValueError(
+            f"{where}: sha256 должен быть 64 шестнадцатеричными знаками, а там {value!r}"
+        )
+    return value
+
+
 def check_manifest(manifest):
     """Проверяет форму models.json целиком и жалуется только ValueError.
 
@@ -180,6 +198,7 @@ def check_manifest(manifest):
             need_text(spot, entry, "repo")
             need_text(spot, entry, "path")
             need_size(spot, entry)
+            need_hash(spot, entry)
             dest_parts(dest)
             first_group, first_entry = seen.setdefault(dest, (name, entry))
             if first_entry != entry:
@@ -258,6 +277,10 @@ def comfy_root(manifest, override=None):
 
 HF_HOST = "https://huggingface.co"
 
+# Что сервер знает о файле. sha256 бывает пустым: у мелких файлов вне LFS его
+# в описи нет, и выдумывать его неоткуда.
+Remote = namedtuple("Remote", "size sha256")
+
 
 def hf_url(repo, path):
     return f"{HF_HOST}/{repo}/resolve/main/{quote(path)}"
@@ -320,13 +343,21 @@ def repo_listing(repo):
             # проверено на sdxl_vae, сошлось с манифестом до байта.
             if isinstance(item, dict) and item.get("type") == "file" \
                     and isinstance(item.get("size"), int):
-                found[item["path"]] = item["size"]
+                # sha256 берём только из lfs.oid. Верхний oid - это git-овый
+                # sha1 блоба, совсем другое число, и подставить его вместо
+                # контрольной суммы значило бы завалить каждую закачку.
+                lfs = item.get("lfs")
+                oid = lfs.get("oid") if isinstance(lfs, dict) else None
+                found[item["path"]] = Remote(
+                    item["size"], oid if isinstance(oid, str) and len(oid) == 64 else None
+                )
     return found
 
 
 # state: "ok" - сходится, "размер" - другой размер, "нет файла" - путь исчез,
 # "репозиторий" - до репозитория вообще не достучались (в now лежит причина).
-Drift = namedtuple("Drift", "group dest repo path state was now")
+# sha - контрольная сумма с сервера, если он её назвал.
+Drift = namedtuple("Drift", "group dest repo path state was now sha")
 
 
 def manifest_entries(manifest):
@@ -338,10 +369,12 @@ def manifest_entries(manifest):
     """
     for name, group in manifest["groups"].items():
         for entry in group["files"]:
-            yield name, entry["dest"], entry["repo"], entry["path"], entry["size"]
+            yield (name, entry["dest"], entry["repo"], entry["path"],
+                   entry["size"], entry.get("sha256"))
     for model in manifest.get("lmstudio", []):
         for item in model["files"]:
-            yield "lmstudio", item["name"], model["search"], item["name"], item["size"]
+            yield ("lmstudio", item["name"], model["search"], item["name"],
+                   item["size"], item.get("sha256"))
 
 
 def manifest_drift(manifest, listing=None):
@@ -354,7 +387,7 @@ def manifest_drift(manifest, listing=None):
     """
     listing = listing or repo_listing
     drifts, shelves = [], {}
-    for group, dest, repo, path, size in manifest_entries(manifest):
+    for group, dest, repo, path, size, _sha in manifest_entries(manifest):
         if repo not in shelves:
             try:
                 shelves[repo] = listing(repo)
@@ -362,34 +395,53 @@ def manifest_drift(manifest, listing=None):
                 shelves[repo] = err
         shelf = shelves[repo]
         if isinstance(shelf, RuntimeError):
-            drifts.append(Drift(group, dest, repo, path, "репозиторий", size, str(shelf)))
+            drifts.append(Drift(group, dest, repo, path, "репозиторий", size,
+                                str(shelf), None))
             continue
         now = shelf.get(path)
         if now is None:
-            drifts.append(Drift(group, dest, repo, path, "нет файла", size, None))
-        elif now != size:
-            drifts.append(Drift(group, dest, repo, path, "размер", size, now))
+            drifts.append(Drift(group, dest, repo, path, "нет файла", size, None, None))
         else:
-            drifts.append(Drift(group, dest, repo, path, "ok", size, now))
+            state = "ok" if now.size == size else "размер"
+            drifts.append(Drift(group, dest, repo, path, state, size, now.size, now.sha256))
     return drifts
 
 
+Applied = namedtuple("Applied", "sizes hashes")
+
+
 def apply_drift(manifest, drifts):
-    """Проставляет новые размеры. Правит только их: путь, уехавший в никуда,
-    угадывать нельзя - какой файл автор имел в виду, знает только человек."""
-    fresh = {(d.group, d.dest): d.now for d in drifts if d.state == "размер"}
-    fixed = 0
+    """Проставляет новые размеры и контрольные суммы.
+
+    Размер правится только там, где он разошёлся. Путь, уехавший в никуда,
+    угадывать нельзя - какой файл автор имел в виду, знает только человек, - и
+    сумму по нему тоже брать неоткуда.
+
+    Сумма проставляется всюду, где сервер её назвал, а в манифесте её нет или
+    она другая. Взять её больше неоткуда: считать самому - значит скачать все
+    95 ГиБ, а сервер отдаёт готовую в той же описи, за тот же один запрос.
+    """
+    sizes = {(d.group, d.dest): d.now for d in drifts if d.state == "размер"}
+    hashes = {(d.group, d.dest): d.sha for d in drifts
+              if d.state in ("ok", "размер") and d.sha}
+    fixed = added = 0
+
+    def поправить(key, entry):
+        nonlocal fixed, added
+        size = sizes.get(key)
+        if size is not None:
+            entry["size"], fixed = size, fixed + 1
+        sha = hashes.get(key)
+        if sha and entry.get("sha256") != sha:
+            entry["sha256"], added = sha, added + 1
+
     for name, group in manifest["groups"].items():
         for entry in group["files"]:
-            size = fresh.get((name, entry["dest"]))
-            if size is not None:
-                entry["size"], fixed = size, fixed + 1
+            поправить((name, entry["dest"]), entry)
     for model in manifest.get("lmstudio", []):
         for item in model["files"]:
-            size = fresh.get(("lmstudio", item["name"]))
-            if size is not None:
-                item["size"], fixed = size, fixed + 1
-    return fixed
+            поправить(("lmstudio", item["name"]), item)
+    return Applied(fixed, added)
 
 
 def save_manifest(manifest, path):
@@ -586,6 +638,57 @@ def server_size(resp, resumed):
     return int(tail) if tail.isdigit() else None
 
 
+class Digest:
+    """Считает sha256 по ходу закачки, пока байты и так текут мимо.
+
+    Отдельным проходом по файлу это стоило бы чтения всех 95 ГиБ, поэтому в
+    README и было написано, что контрольных сумм не будет. На лету - почти
+    даром: байты всё равно проходят через память.
+
+    Помнит, докуда уже досчитано. Без этого каждый обрыв связи заставлял бы
+    перечитывать начало файла заново: на тридцати гигабайтах и сотне обрывов
+    вышло бы три терабайта лишнего чтения с диска. Перечитывается только то,
+    что легло мимо нас - остаток .part от прошлого запуска, и ровно один раз.
+
+    Без ожидаемой суммы не делает ничего и ничего не стоит.
+    """
+
+    def __init__(self, want):
+        self.want = (want or "").strip().lower()
+        self.sum = hashlib.sha256() if self.want else None
+        self.upto = 0
+
+    def restart(self):
+        """Файл начинается с нуля - и счёт вместе с ним."""
+        if self.sum:
+            self.sum, self.upto = hashlib.sha256(), 0
+
+    def catch_up(self, path, upto):
+        """Досчитывает то, что уже лежит на диске, но через нас не проходило."""
+        if not self.sum or self.upto >= upto:
+            return
+        with open(path, "rb") as fh:
+            fh.seek(self.upto)
+            while self.upto < upto:
+                block = fh.read(min(CHUNK, upto - self.upto))
+                if not block:
+                    break
+                self.sum.update(block)
+                self.upto += len(block)
+
+    def add(self, block):
+        if self.sum:
+            self.sum.update(block)
+            self.upto += len(block)
+
+    def mismatch(self):
+        """Что получилось, если оно не то. Пусто - значит сошлось или не проверяли."""
+        if not self.sum:
+            return None
+        got = self.sum.hexdigest()
+        return None if got == self.want else got
+
+
 NO_SPACE = {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}
 
 
@@ -599,10 +702,18 @@ def disk_is_full(err):
 NO_SPACE_MESSAGE = "no space left on the disk, free some and run the same command again"
 
 
-def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None):
-    """Download one file, resuming a leftover .part if there is one."""
+def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None,
+          sha256=None):
+    """Download one file, resuming a leftover .part if there is one.
+
+    sha256 необязателен: без него всё работает ровно как раньше и ничего не
+    стоит. С ним совпадение размера перестаёт быть единственным доказательством
+    целостности - файл, побитый на диске или собранный из двух ревизий модели с
+    одинаковым размером, до сих пор проходил как целый.
+    """
     dest = Path(dest)
     part = part_path(dest)
+    digest = Digest(sha256)
 
     # Всё, что мешает положить файл на место, выясняем до первого байта из сети.
     # Папка с именем файла, файл на месте папки models, том только для чтения -
@@ -728,6 +839,12 @@ def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None)
                         break
                     note(f"starting over from zero ({restarts}/{RETRIES})")
                 best = 0  # файл сейчас обнулится, старая планка уже не про него
+                digest.restart()
+            else:
+                # Дописываем в хвост: то, что лежит в .part с прошлого запуска,
+                # через нас не проходило и в сумму не попало. Досчитываем его
+                # один раз - обрыв посреди файла сюда уже не возвращается.
+                digest.catch_up(part, offset)
 
             # Открываем файл до сетевого try: PermissionError и NotADirectoryError -
             # это тоже OSError, и они попадали в разбор обрывов связи. Двадцать секунд
@@ -751,6 +868,7 @@ def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None)
                         if not block:
                             break
                         out.write(block)
+                        digest.add(block)
                         done += len(block)
                         if on_progress:
                             elapsed = max(time.monotonic() - started, 1e-6)
@@ -796,6 +914,23 @@ def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None)
     if actual != expected:
         reason = f" (last error: {last_error})" if last_error else ""
         raise RuntimeError(f"got {human(actual)}, expected {human(expected)}{reason}")
+
+    # Целый .part с прошлого запуска мог не пройти через нас ни разу - тогда
+    # досчитываем его тут, уже с диска. Это единственный случай, когда за сумму
+    # приходится платить лишним чтением файла.
+    digest.catch_up(part, actual)
+    wrong = digest.mismatch()
+    if wrong:
+        # Не стираем. Отличить побитый файл от устаревшей суммы в models.json
+        # программа не может, а стереть вслепую - это выбросить гигабайты по
+        # догадке. Молча качать заново тоже нельзя: если врёт манифест, круг
+        # будет вечным. Поэтому останавливаемся и говорим, что именно решать.
+        raise RuntimeError(
+            f"sha256 не сошёлся: в models.json {sha256}, а у скачанного {wrong}. "
+            f"Размер при этом верный, так что дело либо в побитом файле, либо в "
+            f"устаревшей сумме. Файл оставлен в {part.name}: убедись, что "
+            f"models.json верен, удали его и запусти заново"
+        )
     # Единственное место, где программа трогает файл под настоящим именем, и до
     # сих пор оно было ничем не прикрыто. Windows не даёт переименовать поверх
     # файла, который кто-то держит открытым, а держит его обычно запущенный

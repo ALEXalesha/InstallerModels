@@ -347,6 +347,112 @@ def a_stalled_connection_is_cut_by_the_timeout():
 
 
 @case
+def a_checksum_catches_what_the_size_cannot():
+    """Совпадение размера перестаёт быть единственным доказательством.
+
+    Файл, побитый на диске или собранный из двух ревизий модели с одинаковым
+    размером, до сих пор проходил как целый: программа смотрела только на число
+    байт. Сумма считается на лету, пока байты и так текут мимо, - отдельным
+    проходом по файлу это стоило бы чтения всех 95 ГиБ.
+    """
+    import hashlib
+
+    верная = hashlib.sha256(BODY).hexdigest()
+
+    # Сходится - файл встаёт на место как обычно.
+    serve("whole")
+    dest = TMP / "sum-ok.bin"
+    core.fetch(URL, dest, SIZE, sha256=верная)
+    assert dest.read_bytes() == BODY
+
+    # Не сходится - файл на место не встаёт, и .part не стирается: отличить
+    # побитый файл от устаревшей суммы программа не может, а стереть вслепую
+    # значит выбросить гигабайты по догадке.
+    serve("whole")
+    плохой = TMP / "sum-bad.bin"
+    try:
+        core.fetch(URL, плохой, SIZE, sha256="f" * 64)
+    except RuntimeError as err:
+        assert "sha256 не сошёлся" in str(err), err
+        assert верная in str(err), "в ошибке нет того, что получилось на деле"
+        assert плохой.name + ".part" in str(err), "не сказано, что удалять"
+    else:
+        raise AssertionError("несовпадение суммы обязано было всплыть")
+    assert not плохой.exists(), "файл с чужой суммой нельзя выдавать за готовый"
+    assert core.part_path(плохой).read_bytes() == BODY, "скачанное стёрли"
+
+    # Без суммы в манифесте всё как раньше: ни проверки, ни расхода.
+    serve("whole")
+    просто = TMP / "sum-none.bin"
+    core.fetch(URL, просто, SIZE)
+    assert просто.read_bytes() == BODY
+
+
+@case
+def a_checksum_survives_a_resume_without_rereading_everything():
+    """Докачка не должна ни ломать сумму, ни перечитывать файл каждый обрыв.
+
+    Наивный подсчёт пересчитывал бы начало файла после каждого обрыва: на
+    тридцати гигабайтах и сотне обрывов это три терабайта лишнего чтения с
+    диска. Считается только то, что легло мимо нас, и ровно один раз.
+    """
+    import hashlib
+
+    верная = hashlib.sha256(BODY).hexdigest()
+
+    # Кусок от прошлого запуска через нас не проходил - его досчитывают с диска.
+    serve("whole")
+    dest = TMP / "sum-resume.bin"
+    core.part_path(dest).write_bytes(BODY[:40000])
+    core.fetch(URL, dest, SIZE, sha256=верная)
+    assert dest.read_bytes() == BODY, "докачанный файл не совпал"
+
+    # Рваная связь: пятнадцать обрывов, и сумма всё равно верная.
+    serve("flaky")
+    рваный = TMP / "sum-flaky.bin"
+    core.fetch(URL, рваный, SIZE, sha256=верная)
+    assert рваный.read_bytes() == BODY
+    assert Handler.hits == 15, f"подходов {Handler.hits}, ждали 15"
+
+    # Целый .part от прошлого запуска: качать нечего, но через нас он не
+    # проходил ни байтом, и сумму надо досчитать с диска. Это единственный
+    # случай, когда за неё платят лишним чтением файла.
+    serve("whole")
+    целый = TMP / "sum-whole.bin"
+    core.part_path(целый).write_bytes(BODY)
+    core.fetch(URL, целый, SIZE, sha256=верная)
+    assert целый.read_bytes() == BODY, "целый .part не встал на место"
+    assert Handler.hits == 0, "целый .part качать заново незачем"
+
+    # А если содержимое чужое - размер тот же, а сумма нет, и это ловится.
+    serve("whole")
+    чужой = TMP / "sum-alien.bin"
+    core.part_path(чужой).write_bytes(bytes(SIZE))   # нужного размера, но не тот
+    try:
+        core.fetch(URL, чужой, SIZE, sha256=верная)
+    except RuntimeError as err:
+        assert "sha256 не сошёлся" in str(err), err
+    else:
+        raise AssertionError("целый .part с чужим содержимым обязан был всплыть")
+    assert Handler.hits == 0, "целый .part качать заново незачем"
+
+
+@case
+def a_hash_in_the_manifest_must_be_a_real_hash():
+    """Обрезанная или сбитая строка не поймает ни одной поломки, зато завалит
+    закачку целого файла - и человек пойдёт искать беду не там."""
+    good = {"repo": "r", "path": "p", "dest": "models/a.bin", "size": 1}
+    core.need_hash("где-то", good)                      # без суммы - можно
+    core.need_hash("где-то", dict(good, sha256="A" * 64))  # заглавные - можно
+    for bad in ("", "abc", "z" * 64, "a" * 63, "a" * 65, 123, True, ["a" * 64]):
+        try:
+            core.need_hash("где-то", dict(good, sha256=bad))
+        except ValueError:
+            continue
+        raise AssertionError(f"кривая сумма прошла: {bad!r}")
+
+
+@case
 def dest_outside_the_root_is_refused():
     """Path("C:/ComfyUI") / "C:/qwe.bin" - это просто "C:/qwe.bin". Опечатка в
     dest писала мимо папки ComfyUI, и никто этого не проверял."""
@@ -499,10 +605,23 @@ def the_readme_links_to_docs_that_exist():
     assert not missing, f"README ссылается на то, чего нет: {missing}"
 
 
-def как_на_сервере(*files):
-    """Опись репозитория в том виде, в каком её отдаёт Hugging Face."""
-    return [{"type": "file", "path": path, "size": size, "oid": "0" * 40}
-            for path, size in files]
+ХЕШ = {"a.bin": "a" * 64, "sub/b.bin": "b" * 64, "m.gguf": "c" * 64}
+
+
+def как_на_сервере(*files, lfs=True):
+    """Опись репозитория в том виде, в каком её отдаёт Hugging Face.
+
+    Верхний oid - это git-овый sha1 блоба, а не контрольная сумма файла.
+    Настоящий sha256 лежит в lfs.oid, и брать можно только его: подставь
+    вместо суммы sha1, и каждая закачка станет падать на сверке.
+    """
+    out = []
+    for path, size in files:
+        item = {"type": "file", "path": path, "size": size, "oid": "0" * 40}
+        if lfs:
+            item["lfs"] = {"oid": ХЕШ[path], "size": size}
+        out.append(item)
+    return out
 
 
 SYNC_MANIFEST = {
@@ -546,9 +665,27 @@ def the_manifest_can_be_checked_against_the_server():
     assert по_месту["models/vae/b.bin"].state == "нет файла"
     assert по_месту["m.gguf"].state == "ok", "раздел lmstudio тоже надо сверять"
 
-    assert core.apply_drift(manifest, drifts) == 1, "поправить надо было ровно один размер"
+    сделано = core.apply_drift(manifest, drifts)
+    assert сделано.sizes == 1, f"поправить надо было один размер, а вышло {сделано.sizes}"
     assert manifest["groups"]["g"]["files"][0]["size"] == 111
     assert manifest["groups"]["g"]["files"][1]["size"] == 200, "исчезнувший путь трогать нельзя"
+
+    # Сумму сервер отдаёт в той же описи, за тот же запрос: считать её самим -
+    # значит скачать все 95 ГиБ. Ставится она и там, где размер сошёлся.
+    assert manifest["groups"]["g"]["files"][0]["sha256"] == ХЕШ["a.bin"]
+    assert manifest["lmstudio"][0]["files"][0]["sha256"] == ХЕШ["m.gguf"]
+    assert "sha256" not in manifest["groups"]["g"]["files"][1], \
+        "у исчезнувшего файла сумму брать неоткуда"
+    assert сделано.hashes == 2, f"сумм должно было лечь две, а легло {сделано.hashes}"
+
+    # Второй заход по тому же манифесту ничего не меняет: суммы уже на месте.
+    assert core.apply_drift(manifest, core.manifest_drift(manifest)) == (0, 0)
+
+    # Мелкие файлы вне LFS суммы не имеют, и выдумывать её неоткуда.
+    Handler.tree, Handler.hits = как_на_сервере(("a.bin", 100), lfs=False), 0
+    голый = copy.deepcopy(SYNC_MANIFEST)
+    assert core.apply_drift(голый, core.manifest_drift(голый)).hashes == 0
+    assert "sha256" not in голый["groups"]["g"]["files"][0]
 
 
 @case
@@ -570,17 +707,31 @@ def a_synced_manifest_stays_loadable_and_keeps_its_looks():
     core.save_manifest(core.load_manifest(path), path)
     assert path.read_bytes() == было, "запись без правок изменила файл"
 
-    # А теперь с правкой: меняется одно число, остальное на месте.
+    # Правка одного размера меняет ровно одну строку. Сумм тут нет нарочно:
+    # они не правят, а прибавляют, и это отдельный разговор ниже.
     Handler.pages = None
-    Handler.tree = как_на_сервере(("a.bin", 999), ("sub/b.bin", 200), ("m.gguf", 300))
+    Handler.tree = как_на_сервере(("a.bin", 999), ("sub/b.bin", 200), ("m.gguf", 300),
+                                  lfs=False)
     manifest = core.load_manifest(path)
     core.apply_drift(manifest, core.manifest_drift(manifest))
     core.check_manifest(manifest)      # то, что пишем, обязано проходить загрузку
     core.save_manifest(manifest, path)
     стало = path.read_bytes()
     assert core.load_manifest(path)["groups"]["g"]["files"][0]["size"] == 999
+    assert len(стало.split(b"\r\n")) == len(было.split(b"\r\n")), "число строк изменилось"
     разница = [(a, b) for a, b in zip(было.split(b"\r\n"), стало.split(b"\r\n")) if a != b]
     assert len(разница) == 1, f"изменилось строк: {len(разница)} - {разница[:4]}"
+
+    # А контрольные суммы именно прибавляются - по строке на файл, и манифест
+    # после этого обязан читаться как ни в чём не бывало.
+    Handler.tree = как_на_сервере(("a.bin", 999), ("sub/b.bin", 200), ("m.gguf", 300))
+    manifest = core.load_manifest(path)
+    сделано = core.apply_drift(manifest, core.manifest_drift(manifest))
+    core.save_manifest(manifest, path)
+    выросло = len(path.read_bytes().split(b"\r\n")) - len(стало.split(b"\r\n"))
+    assert сделано == (0, 3), сделано
+    assert выросло == 3, f"строк прибавилось {выросло}, а сумм легло {сделано.hashes}"
+    core.load_manifest(path)   # и это по-прежнему читается
 
 
 @case
@@ -606,7 +757,7 @@ def a_closed_repo_does_not_sink_the_whole_check():
         # нового размера лежит текст ошибки, а не число: подставь его в манифест,
         # и там окажется строка вместо размера. Загружаться он после этого
         # перестанет, а узнается это уже при следующем запуске программы.
-        assert core.apply_drift(manifest, drifts) == 0, \
+        assert core.apply_drift(manifest, drifts) == (0, 0), \
             "по недоступному репозиторию правок быть не может"
         core.check_manifest(manifest)
 
@@ -1009,6 +1160,80 @@ def the_command_line_downloads_reports_and_stops_early():
 
 
 @case
+def the_sync_command_reports_and_refuses_in_the_right_order():
+    """Сама команда сверки не вызывалась ни одной проверкой.
+
+    Отдельно проверялись manifest_drift, apply_drift и save_manifest, а код,
+    который их связывает - отчёт, отказ записывать и три разных кода возврата, -
+    не проходился ни разу. Отказ записывать при недоступном репозитории тут
+    самое важное: записать половину и отчитаться «сверено» хуже, чем не делать
+    ничего, потому что человек решит, что манифест теперь верен целиком.
+    """
+    import contextlib
+    import copy
+    import io
+
+    import install
+
+    путь = TMP / "sync-cli.json"
+
+    def прогнать(write=False):
+        core.save_manifest(copy.deepcopy(SYNC_MANIFEST), путь)
+        manifest = core.load_manifest(путь)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = install.cmd_sync(manifest, путь, write)
+        return code, out.getvalue()
+
+    Handler.pages = None
+
+    # Всё сходится и суммы уже на месте: править нечего.
+    целый = copy.deepcopy(SYNC_MANIFEST)
+    for файл, имя in ((целый["groups"]["g"]["files"][0], "a.bin"),
+                      (целый["groups"]["g"]["files"][1], "sub/b.bin"),
+                      (целый["lmstudio"][0]["files"][0], "m.gguf")):
+        файл["sha256"] = ХЕШ[имя]
+    core.save_manifest(целый, путь)
+    Handler.tree = как_на_сервере(("a.bin", 100), ("sub/b.bin", 200), ("m.gguf", 300))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = install.cmd_sync(core.load_manifest(путь), путь, False)
+    assert code == 0 and "всё сходится" in out.getvalue(), out.getvalue()
+
+    # Размер разошёлся: доложить, но без --write ничего не писать.
+    Handler.tree = как_на_сервере(("a.bin", 555), ("sub/b.bin", 200), ("m.gguf", 300))
+    code, text = прогнать()
+    assert code == 1, text
+    assert "555" in text and "--write" in text, text
+    assert core.load_manifest(путь)["groups"]["g"]["files"][0]["size"] == 100, \
+        "без --write манифест трогать нельзя"
+
+    # С --write - вписать и доложить, сколько чего.
+    code, text = прогнать(write=True)
+    assert code == 0, text
+    свежий = core.load_manifest(путь)
+    assert свежий["groups"]["g"]["files"][0]["size"] == 555
+    assert свежий["groups"]["g"]["files"][0]["sha256"] == ХЕШ["a.bin"]
+    assert "размеров 1" in text and "сумм 3" in text, text
+
+    # Путь исчез: сказать про него и не выдумывать ничего.
+    Handler.tree = как_на_сервере(("a.bin", 100), ("m.gguf", 300))
+    code, text = прогнать(write=True)
+    assert code == 1, text
+    assert "пропал" in text and "руками" in text, text
+    assert core.load_manifest(путь)["groups"]["g"]["files"][1]["size"] == 200
+
+    # Репозиторий недоступен: не писать ничего, даже про уцелевшие записи.
+    Handler.tree = 500
+    code, text = прогнать(write=True)
+    assert code == 1, text
+    assert "не вышло" in text and "ничего не записываю" in text, text
+    нетронутый = core.load_manifest(путь)
+    assert "sha256" not in нетронутый["groups"]["g"]["files"][0], \
+        "при недоступном репозитории записано быть ничего не должно"
+
+
+@case
 def the_progress_line_never_breaks():
     """Полоска в консоли рисуется поверх самой себя, и её ширина - часть
     рисунка. "999999:00" при смешной скорости в начале файла и "-1:-30", когда
@@ -1226,7 +1451,33 @@ def the_window_builds_and_survives_every_event():
         assert показано == [("ошибка", "Папка не найдена")], показано
         assert app.worker is None, "ушёл качать в несуществующую папку"
 
-        app.closing = True
+        # «Обзор»: выбор папки запоминается так же, как набранный руками.
+        было_диалог = gui.filedialog
+        gui.filedialog = type("Ф", (), {"askdirectory": staticmethod(
+            lambda **kw: str(root))})
+        try:
+            app.pick_folder()
+        finally:
+            gui.filedialog = было_диалог
+        assert app.root_path.get() == str(root)
+
+        # «Отмена»: поднимает флаг для потока и запирает себя, чтобы второй раз
+        # не нажали. Сам поток при этом дожимает текущий кусок.
+        app.stop_flag.clear()
+        app.cancel_button.configure(state="normal")
+        app.cancel()
+        assert app.stop_flag.is_set(), "флаг отмены не поднялся, поток не остановится"
+        assert str(app.cancel_button.cget("state")) == "disabled"
+
+        # Закрытие: без живого потока обязано пройти без вопросов и погасить
+        # насос событий, иначе он сработает на уже разрушенном окне.
+        показано.clear()
+        app.rows.clear()
+        app.root_path = None
+        app.on_close()
+        assert показано == [], f"закрытие без закачки не должно ничего спрашивать: {показано}"
+        assert app.closing is True
+        window = None    # окно уже разрушено самим on_close
     finally:
         gui.messagebox = было_окно
         if было_root is None:
@@ -1247,6 +1498,146 @@ def the_window_builds_and_survives_every_event():
             gc.collect()
             window.destroy()
             gc.collect()
+
+
+@case
+def the_window_download_loop_handles_every_ending():
+    """Цикл скачивания в потоке окна не вызывался ни одной проверкой.
+
+    Арифметика полосок перебиралась отдельно, а код, который её крутит, - нет:
+    очередь файлов, ветка ошибки, ветка отмены, аварийный перехват. Он живёт с
+    первой версии и до сих пор проверялся только глазами.
+
+    Гоняем прямо, а не в потоке: поток тут ничего не меняет, а прогон от него
+    стал бы зависеть от расписания.
+    """
+    import threading as нити
+
+    import gui
+
+    root = TMP / "job-root"
+    root.mkdir(exist_ok=True)
+    job = [{"dest": "models/vae/один.bin", "repo": "r", "path": "p", "size": SIZE},
+           {"dest": "models/vae/два.bin", "repo": "r", "path": "p", "size": SIZE}]
+
+    class Окно:
+        """Всё, чего run_job касается снаружи: очередь событий и флаг отмены."""
+
+        def __init__(self):
+            self.events = __import__("queue").Queue()
+            self.stop_flag = нити.Event()
+
+        part_size = staticmethod(gui.App.part_size)
+        run_job = gui.App.run_job
+
+        def выгрести(self):
+            out = []
+            while not self.events.empty():
+                out.append(self.events.get_nowait())
+            return out
+
+    # Оба файла скачались.
+    serve("whole")
+    окно = Окно()
+    окно.run_job(job, root)
+    события = окно.выгрести()
+    failed, cancelled = dict(события)["done"]
+    assert (failed, cancelled) == ([], False), (failed, cancelled)
+    assert (root / "models/vae/один.bin").read_bytes() == BODY
+    assert (root / "models/vae/два.bin").read_bytes() == BODY
+    полоски = [payload for kind, payload in события if kind == "progress"]
+    assert полоски[-1][2] == полоски[-1][3], "в конце полоска «всего» обязана быть полной"
+    assert полоски[-1][4] == 0, "и лететь по сети больше нечему"
+
+    # Оба сорвались: очередь не бросается на первом же, и в конце список неудач.
+    serve("gone")
+    for имя in ("один.bin", "два.bin"):
+        (root / "models/vae" / имя).unlink()
+    окно = Окно()
+    окно.run_job(job, root)
+    события = окно.выгрести()
+    failed, cancelled = dict(события)["done"]
+    assert len(failed) == 2 and not cancelled, (failed, cancelled)
+    assert any("ОШИБКА" in p for k, p in события if k == "log"), события
+
+    # Отмена: очередь обрывается, и это не ошибка.
+    serve("whole")
+    окно = Окно()
+    окно.stop_flag.set()
+    окно.run_job(job, root)
+    failed, cancelled = dict(окно.выгрести())["done"]
+    assert cancelled and failed == [], (failed, cancelled)
+
+    # Что бы ни случилось внутри, событие done обязано уйти: без него окно
+    # осталось бы с заблокированной кнопкой и без единого объяснения.
+    окно = Окно()
+    окно.run_job([{"dest": "models/vae/х.bin", "repo": "r"}], root)   # нет path и size
+    события = dict(окно.выгрести())
+    assert "done" in события, "done не ушло, окно осталось бы запертым навсегда"
+    assert события["done"][0], "внутренняя ошибка обязана попасть в список неудач"
+
+
+@case
+def the_clipboard_survives_the_window_closing():
+    """Tk отдаёт буфер обмена по запросу и только пока окно живо.
+
+    Кнопка «Копировать» рассчитана ровно на то, чтобы скопировать название и
+    уйти в LM Studio, то есть закрыв окно. Починка была, а сторожа у неё не
+    было: проверялась она черновым скриптом, в прогон не попала.
+    """
+    import tkinter as tk
+
+    import gui
+
+    window = None
+    try:
+        try:
+            window = tk.Tk()
+        except tk.TclError as err:
+            raise AssertionError(f"Tk не поднялся: {err}") from None
+        window.withdraw()
+        app = gui.App(window)
+        app.copy("lmstudio-community/gemma-4-E2B-it-GGUF")
+        assert window.clipboard_get() == "lmstudio-community/gemma-4-E2B-it-GGUF"
+        assert "скопировано" in app.log_text.get("1.0", "end")
+        app.rows.clear()
+        app.root_path = None
+        app.closing = True
+    finally:
+        if window is not None:
+            gc.collect()
+            window.destroy()
+            gc.collect()
+
+
+@case
+def the_build_lays_out_what_people_read():
+    """Рядом с exe кладутся models.json, README и папка docs.
+
+    models.json там ещё и перебивает встроенный в exe - на этом держится вся
+    правка списка моделей без пересборки. Раньше README клался один, и половина
+    ссылок из него вела в пустоту.
+    """
+    import build
+
+    куда = TMP / "рядом-с-exe"
+    куда.mkdir(exist_ok=True)
+    build.lay_out_extras(куда)
+
+    assert (куда / "models.json").read_bytes() == (HERE / "models.json").read_bytes()
+    assert (куда / "README.md").exists()
+    for name in ("build.md", "models.md", "lmstudio.md", "tests.md"):
+        assert (куда / "docs" / name).exists(), f"docs/{name} не доехал"
+    # Каждая ссылка из README обязана разрешаться и там, куда мы это положили.
+    import re as regex
+    readme = (куда / "README.md").read_text(encoding="utf-8")
+    for link in regex.findall(r"\((docs/[^)]+)\)", readme):
+        assert (куда / link).exists(), f"рядом с exe нет {link}"
+    assert build.folder_size(куда) > 0
+
+    # Повторная раскладка поверх готовой папки обязана проходить: установка
+    # поверх старой версии делает ровно это.
+    build.lay_out_extras(куда)
 
 
 @case

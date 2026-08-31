@@ -11,31 +11,36 @@
           "dest": "models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors",
           "repo": "Lightricks/LTX-2.3-fp8",
           "path": "ltx-2.3-22b-dev-fp8.safetensors",
-          "size": 29145431166
+          "size": 29145431166,
+          "sha256": "28606c5b5a06ce56f896d4dfcb20f212739e07a68fbe48e53638188449d26450"
         },
         {
           "dest": "models/latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
           "repo": "Lightricks/LTX-2.3",
           "path": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
-          "size": 995743560
+          "size": 995743560,
+          "sha256": "5f416311fa8172b65af67530758964708d29a317b830d689a51143b7f91913ed"
         },
         {
           "dest": "models/loras/ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors",
           "repo": "Comfy-Org/ltx-2.3",
           "path": "split_files/loras/ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors",
-          "size": 2741024390
+          "size": 2741024390,
+          "sha256": "31e0c0195fb841bf31af78e8b60858f489e87ddcea4a5239abc80943da65e3ac"
         },
         {
           "dest": "models/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors",
           "repo": "Comfy-Org/ltx-2",
           "path": "split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors",
-          "size": 9447702218
+          "size": 9447702218,
+          "sha256": "aaca463d11e6d8d2a4bdb0d6299214c15ef78a3f73e0ef8113d5a9d0219b3f6d"
         },
         {
           "dest": "models/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors",
           "repo": "Comfy-Org/ltx-2",
           "path": "split_files/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors",
-          "size": 628203616
+          "size": 628203616,
+          "sha256": "87bcabeac9bec9f374232b5122d6511c2b2112d479e50176149e944b3712eb4a"
         }
       ]
     },
@@ -48,25 +53,29 @@
           "dest": "models/unet/Qwen-Image-Edit-2509-Q5_K_M.gguf",
           "repo": "QuantStack/Qwen-Image-Edit-2509-GGUF",
           "path": "Qwen-Image-Edit-2509-Q5_K_M.gguf",
-          "size": 14934899232
+          "size": 14934899232,
+          "sha256": "9e3f23a2c662fd4ccc84ca259fa93a6e5a6beec81a51662f4437a6a399b84d87"
         },
         {
           "dest": "models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
           "repo": "Comfy-Org/Qwen-Image_ComfyUI",
           "path": "split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
-          "size": 9384670680
+          "size": 9384670680,
+          "sha256": "cb5636d852a0ea6a9075ab1bef496c0db7aef13c02350571e388aea959c5c0b4"
         },
         {
           "dest": "models/vae/qwen_image_vae.safetensors",
           "repo": "Comfy-Org/Qwen-Image_ComfyUI",
           "path": "split_files/vae/qwen_image_vae.safetensors",
-          "size": 253806246
+          "size": 253806246,
+          "sha256": "a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f"
         },
         {
           "dest": "models/loras/Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors",
           "repo": "lightx2v/Qwen-Image-Lightning",
           "path": "Qwen-Image-Edit-2509/Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors",
-          "size": 849608296
+          "size": 849608296,
+          "sha256": "2a32ce938ec71db2b49a817b4844ae86995569518dea56ee0ddc209cbe8e1377"
         }
       ]
     },
@@ -79,13 +88,15 @@
           "dest": "models/checkpoints/juggernautXL_juggXIByRundiffusion.safetensors",
           "repo": "RunDiffusion/Juggernaut-XI-v11",
           "path": "Juggernaut-XI-byRunDiffusion.safetensors",
-          "size": 7105350536
+          "size": 7105350536,
+          "sha256": "33e58e86686f6b386c526682b5da9228ead4f91d994abd4b053442dc5b42719e"
         },
         {
           "dest": "models/vae/sdxl_vae.safetensors",
           "repo": "stabilityai/sdxl-vae",
           "path": "sdxl_vae.safetensors",
-          "size": 334641164
+          "size": 334641164,
+          "sha256": "63aeecb90ff7bc1c115395962d3e803571385b61938377bc7089b36e81e92e2e"
         }
       ]
     },
@@ -98,7 +109,8 @@
           "dest": "models/text_encoders/gemma4_e4b_it_fp8_scaled.safetensors",
           "repo": "Comfy-Org/gemma-4",
           "path": "text_encoders/gemma4_e4b_it_fp8_scaled.safetensors",
-          "size": 9057782194
+          "size": 9057782194,
+          "sha256": "bf0b4fa2e41a25684dc9e9b256cd505564f02fed09be3da95ce024e653e2c52b"
         }
       ]
     },
@@ -111,7 +123,8 @@
           "dest": "models/checkpoints/ace_step_v1_3.5b.safetensors",
           "repo": "Comfy-Org/ACE-Step_ComfyUI_repackaged",
           "path": "all_in_one/ace_step_v1_3.5b.safetensors",
-          "size": 7699743341
+          "size": 7699743341,
+          "sha256": "f07cad74c4adce52ca14ca1bdf74cf3c14cbafb0823b95eca4459467fa369f40"
         }
       ]
     },
@@ -124,7 +137,8 @@
           "dest": "models/checkpoints/hunyuan_3d_v2.1.safetensors",
           "repo": "Comfy-Org/hunyuan3D_2.1_repackaged",
           "path": "hunyuan_3d_v2.1.safetensors",
-          "size": 7365943290
+          "size": 7365943290,
+          "sha256": "5f21e98a6cb99b13b5e224abaee33929570fff7af2b6a0060001559a04ba9d72"
         }
       ]
     },
@@ -137,7 +151,8 @@
           "dest": "models/clip_vision/CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors",
           "repo": "Comfy-Org/CLIP-ViT-H-14-laion2B-s32B-b79K_repackaged",
           "path": "split_files/clip_vision/CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors",
-          "size": 2528373448
+          "size": 2528373448,
+          "sha256": "6ca9667da1ca9e0b0f75e46bb030f7e011f44f86cbfb8d5a36590fcd7507b030"
         }
       ]
     }
@@ -150,11 +165,13 @@
       "files": [
         {
           "name": "gemma-4-E2B-it-Q4_K_M.gguf",
-          "size": 3427880384
+          "size": 3427880384,
+          "sha256": "71e6e8cb64a76da1a734fb8f6ba389d2784950d9902f5e87244fca0a15190c94"
         },
         {
           "name": "mmproj-gemma-4-E2B-it-BF16.gguf",
-          "size": 986833248
+          "size": 986833248,
+          "sha256": "04125f8e2a1135824e48064c32157356704e6681a9f3af669af321a3c70c39d7"
         }
       ]
     },
@@ -165,11 +182,13 @@
       "files": [
         {
           "name": "Qwen3-VL-4B-Instruct-Q4_K_M.gguf",
-          "size": 2497281568
+          "size": 2497281568,
+          "sha256": "aa18af1fdda59081005319536eebff9406d556ce8a753d9a3aa81cf635eadde7"
         },
         {
           "name": "mmproj-Qwen3-VL-4B-Instruct-F16.gguf",
-          "size": 836180160
+          "size": 836180160,
+          "sha256": "1b70e983d69dd424eb16e0ed2104d0b2a58bf01d866657f4de5da6c963620f19"
         }
       ]
     }

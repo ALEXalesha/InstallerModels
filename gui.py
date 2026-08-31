@@ -110,11 +110,15 @@ class App(ttk.Frame):
         self.stop_flag = threading.Event()
         self.worker = None
         self.closing = False
+        self.pump = None
         self.rows = {}
 
         self.build()
         self.refresh()
-        self.after(100, self.drain_events)
+        # Держим номер отложенного вызова: без него уже назначенный насос
+        # срабатывает на разрушенном окне и печатает в stderr «invalid command
+        # name». В окне этого не видно, а в прогоне выглядит как поломка.
+        self.pump = self.after(100, self.drain_events)
 
     # --- построение окна ---
 
@@ -419,12 +423,19 @@ class App(ttk.Frame):
         оставила бы окно с заблокированной кнопкой и без единого объяснения.
         """
         put = self.events.put
-        bars = QueueProgress([e["size"] for e in job],
-                             [self.part_size(root, e) for e in job])
         failed = []
         cancelled = False
 
         try:
+            # Внутри try, а не до него. part_size() ходит на диск, а диск умеет
+            # исчезать: отключили сетевой, вынули флешку - окно этот случай и в
+            # refresh() отдельно обрабатывает. Пока эта строка стояла снаружи,
+            # такая ошибка уносила с собой событие done, и окно оставалось с
+            # заблокированной кнопкой навсегда - ровно то, от чего finally ниже
+            # и поставлен. Нашлось это первой же проверкой, которая до цикла
+            # вообще добралась.
+            bars = QueueProgress([e["size"] for e in job],
+                                 [self.part_size(root, e) for e in job])
             for n, entry in enumerate(job, 1):
                 put(("file", f"[{n}/{len(job)}] {entry['dest']}  ({size_ru(entry['size'])})"))
                 put(("log", f"качаю {entry['dest']} из {entry['repo']}"))
@@ -438,6 +449,7 @@ class App(ttk.Frame):
                         hf_url(entry["repo"], entry["path"]),
                         dest_path(root, entry["dest"]),
                         entry["size"],
+                        sha256=entry.get("sha256"),
                         on_progress=on_progress,
                         on_note=lambda text: put(("log", f"  {text}")),
                         should_stop=self.stop_flag.is_set,
@@ -506,7 +518,7 @@ class App(ttk.Frame):
             print(f"сбой насоса событий: {type(err).__name__}: {err}", file=sys.stderr)
         finally:
             if not self.closing:
-                self.after(100, self.drain_events)
+                self.pump = self.after(100, self.drain_events)
 
     def finish_job(self, failed, cancelled):
         self.lock_controls(False)
@@ -552,6 +564,8 @@ class App(ttk.Frame):
             # чем показывала полоска.
             self.worker.join(timeout=5)
         self.closing = True
+        if self.pump is not None:
+            self.after_cancel(self.pump)
         self.master.destroy()
 
 

@@ -67,7 +67,7 @@ C:\Users\User\.lmstudio\models\lmstudio-community\Qwen3-VL-4B-Instruct-GGUF\
 
 ## Быстрая справка из скрипта
 
-Те же названия можно получить командой:
+Те же названия, кванты и ключи моделей показывает вкладка «LM Studio» в окне программы, с кнопкой «Копировать». Или командой:
 
 ```bash
 python install.py --lmstudio

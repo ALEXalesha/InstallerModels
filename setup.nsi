@@ -1,10 +1,10 @@
 ﻿; Установщик InstallerModels. Ставит для текущего пользователя, без прав администратора.
-; Собирается из build.py, вручную: makensis /DVERSION=1.0.4 setup.nsi
+; Собирается из build.py, вручную: makensis /DVERSION=1.0.5 setup.nsi
 
 Unicode true
 
 !ifndef VERSION
-  !define VERSION "1.0.4"
+  !define VERSION "1.0.5"
 !endif
 
 !define APP     "InstallerModels"
@@ -37,6 +37,11 @@ VIAddVersionKey "LegalCopyright" "${PUBLISH}"
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_COMPONENTS
+; Папку установки на этой странице можно поменять на любую - хоть на рабочий
+; стол, хоть на папку с документами. Файлы легли бы туда поверх чужих, а
+; деинсталлятор потом сносит папку установки целиком, вместе со всем, что
+; человек в ней держал. Пускаем только в пустую папку или в свою же.
+!define MUI_PAGE_CUSTOMFUNCTION_LEAVE CheckInstallDir
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -65,6 +70,44 @@ FunctionEnd
 
 !insertmacro RunningCheck ""
 !insertmacro RunningCheck "un."
+
+; Пусто ли в папке. FindFirst на несуществующей папке сразу отдаёт пустую
+; строку, так что "такой ещё нет" считается пустой - это то, что нужно.
+Function DirIsEmpty
+  Exch $R0
+  Push $R1
+  Push $R2
+  FindFirst $R1 $R2 "$R0\*.*"
+  loop:
+    StrCmp $R2 "" empty
+    StrCmp $R2 "." next
+    StrCmp $R2 ".." next
+    FindClose $R1
+    StrCpy $R0 "0"
+    Goto done
+  next:
+    FindNext $R1 $R2
+    Goto loop
+  empty:
+    FindClose $R1
+    StrCpy $R0 "1"
+  done:
+  Pop $R2
+  Pop $R1
+  Exch $R0
+FunctionEnd
+
+Function CheckInstallDir
+  ; Своя же папка от прошлой версии - это обычное обновление поверх.
+  IfFileExists "$INSTDIR\${APP}.exe" ok
+  Push $INSTDIR
+  Call DirIsEmpty
+  Pop $R0
+  StrCmp $R0 "1" ok
+  MessageBox MB_OK|MB_ICONSTOP "В папке$\n$\n$INSTDIR$\n$\nуже что-то лежит, и это не ${APP}.$\n$\nВыбери пустую или новую папку: при удалении программа сносит свою папку целиком, вместе со всем, что в ней окажется."
+  Abort
+  ok:
+FunctionEnd
 
 Section "Программа" SecMain
   SectionIn RO
@@ -131,6 +174,7 @@ Section "Uninstall"
 
   ; Если exe кто-то унёс руками, ограничиваемся тем, что клали сами.
   RMDir /r "$INSTDIR\_internal"
+  RMDir /r "$INSTDIR\docs"
   Delete "$INSTDIR\${APP}.exe"
   Delete "$INSTDIR\models.json"
   Delete "$INSTDIR\README.md"

@@ -37,6 +37,11 @@ class Progress:
     def update(self, done, total, speed):
         pct = done * 100 / total if total else 0
         eta = (total - done) / speed if speed > 0 else 0
+        # Скорость в начале файла считается по первым килобайтам и бывает
+        # смешной, а на .part done обгоняет total после правки размера в
+        # манифесте. И то и другое ломало строку: "999999:00" разъезжало полоску,
+        # а отрицательный остаток печатался как "-1:-30".
+        eta = min(max(eta, 0), 999 * 60 + 59)
         clock = f"{int(eta // 60):3d}:{int(eta % 60):02d}"
 
         if INTERACTIVE:
@@ -67,9 +72,18 @@ def cmd_list(manifest, root):
     print(f"\n  everything: {human(grand)}")
 
 
-def cmd_check(manifest, root):
+def cmd_check(manifest, root, keys=None):
+    """Без названий групп проверяет всё, с названиями - только их.
+
+    Раньше keys сюда не доходили вовсе: "install.py --check ltx" молча проверял
+    все 95 ГиБ, а "--check ltxx" с опечаткой - тоже все, и про опечатку не
+    говорил никто. Проверка названий теперь идёт до разбора команды, одна на
+    --check и на установку.
+    """
     bad = 0
-    for key, group in manifest["groups"].items():
+    chosen = keys or list(manifest["groups"])
+    for key in chosen:
+        group = manifest["groups"][key]
         print(f"\n{key} - {group['title']}")
         for entry in group["files"]:
             state, actual = status(entry, root)
@@ -91,6 +105,12 @@ def cmd_lmstudio(manifest):
         total = sum(f["size"] for f in model["files"])
         print(f"  {model['search']}")
         print(f"    quant to pick: {model['quant']}   total {human(total)}")
+        # lms_key лежал в models.json и был расписан в docs/lmstudio.md, а
+        # программа его не показывала нигде. Именно этим ключом модель зовут
+        # из "lms load" и из API, так что искать его в документации мимо
+        # программы - лишний шаг ровно там, где программа и нужна.
+        if model.get("lms_key"):
+            print(f"    model key in LM Studio: {model['lms_key']}")
         print(f"    CLI:  lms get {model['search']}")
         for item in model["files"]:
             print(f"    - {item['name']}  {human(item['size'])}")
@@ -214,15 +234,15 @@ def main():
         print("pass --root PATH, set COMFYUI_ROOT or edit comfyui_root in models.json")
         return 1
 
-    if args.check:
-        return cmd_check(manifest, root)
-
     keys = groups if args.all else unique(args.groups)
     unknown = [k for k in keys if k not in manifest["groups"]]
     if unknown:
         print(f"unknown group(s): {', '.join(unknown)}")
         print(f"available: {', '.join(groups)}")
         return 1
+
+    if args.check:
+        return cmd_check(manifest, root, keys)
 
     return cmd_install(manifest, root, keys, args.dry_run)
 

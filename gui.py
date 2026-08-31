@@ -141,6 +141,10 @@ class App(ttk.Frame):
         ttk.Label(top, text="Папка ComfyUI:").grid(row=0, column=0, sticky="w")
         self.root_entry = ttk.Entry(top, textvariable=self.root_path)
         self.root_entry.grid(row=0, column=1, sticky="we", padx=6)
+        # Путь можно и набрать руками, а не только выбрать «Обзором». Набранный
+        # до сих пор никуда не шёл: строка в поле менялась, а список групп
+        # оставался от прошлой папки, и запомнен такой путь тоже не был.
+        self.root_entry.bind("<Return>", self.apply_typed_root)
         self.browse_button = ttk.Button(top, text="Обзор", command=self.pick_folder, width=10)
         self.browse_button.grid(row=0, column=2)
         self.disk_label = ttk.Label(top, foreground="#555555")
@@ -224,11 +228,17 @@ class App(ttk.Frame):
                        command=lambda s=model["search"]: self.copy(s)).grid(row=0, column=1, padx=(6, 0))
 
             names = "\n".join(f"    {f['name']}  -  {size_ru(f['size'])}" for f in model["files"])
+            # lms_key лежит в models.json и расписан в docs/lmstudio.md, а окно
+            # его не показывало: этим ключом модель зовут из "lms load" и из API,
+            # и за ним приходилось лезть в документацию мимо программы.
+            head = f"квант {model['quant']}, всего {size_ru(total)}"
+            if model.get("lms_key"):
+                head += f"\nключ модели в LM Studio: {model['lms_key']}"
             ttk.Label(
                 box,
                 justify="left",
                 foreground="#555555",
-                text=f"квант {model['quant']}, всего {size_ru(total)}\n{names}",
+                text=f"{head}\n{names}",
             ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
     # --- действия ---
@@ -251,6 +261,12 @@ class App(ttk.Frame):
     def copy(self, text):
         self.clipboard_clear()
         self.clipboard_append(text)
+        # Tk отдаёт буфер обмена не сразу, а по запросу, и владелец у него -
+        # живое окно. Закроешь программу, не успев вставить, - вставлять уже
+        # нечего. Ровно тот случай, на который кнопка и рассчитана: скопировал
+        # название, закрыл окно, пошёл в LM Studio. update() заставляет Tk
+        # отдать строку системе прямо сейчас.
+        self.update()
         self.log(f"скопировано: {text}")
 
     def pick_folder(self):
@@ -259,6 +275,13 @@ class App(ttk.Frame):
             self.root_path.set(chosen)
             remember_root(chosen)
             self.refresh()
+
+    def apply_typed_root(self, _event=None):
+        """Enter в поле пути: перечитать папку и запомнить её, как после «Обзора»."""
+        root = self.current_root()
+        if root.is_dir():
+            remember_root(root)
+        self.refresh()
 
     def current_root(self):
         # expanduser здесь не для красоты: comfy_root() его делает, и без него

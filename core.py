@@ -44,16 +44,39 @@ def manifest_path():
 def human(nbytes):
     size = float(nbytes)
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if abs(size) < 1024 or unit == "TiB":
-            return f"{size:.0f} B" if unit == "B" else f"{size:.1f} {unit}"
+        # Единицу выбираем по округлённому числу, а не по исходному. Иначе
+        # 1023.6 байта печаталось как "1024 B", а 1048570 - как "1024.0 KiB":
+        # число уже переросло свою единицу, а подпись рядом осталась старая.
+        # Видно это было на скорости - она дробная и через human() идёт всегда.
+        digits = 0 if unit == "B" else 1
+        if unit == "TiB" or abs(round(size, digits)) < 1024:
+            return f"{size:.{digits}f} {unit}"
         size /= 1024
+
+
+# Имена, которые Windows отдаёт устройствам, а не файлам, - и с любым расширением:
+# "CON.bin" это тоже консоль. Открыть такой файл получается, запись в него уходит
+# в никуда и не жалуется, а на диске потом ничего нет.
+DEVICE_NAMES = {"CON", "PRN", "AUX", "NUL",
+                *(f"COM{n}" for n in range(1, 10)),
+                *(f"LPT{n}" for n in range(1, 10))}
+
+# Windows их не хранит: часть просто запрещена, а хвостовые пробелы и точки он
+# молча срезает - файл ложится под другим именем, и status() потом его не находит.
+FORBIDDEN = set('<>:"|?*') | {chr(code) for code in range(32)}
 
 
 def dest_parts(dest):
     """Разбирает dest на части и заодно проверяет его. Не паранойя, а защита от
     опечатки: pathlib на Path(root) / "C:/qwe.bin" выбрасывает root целиком и
     пишет мимо ComfyUI, а ".." уводит на уровень выше. До сих пор никто не
-    смотрел, что вообще написано в dest, и такая строка молча срабатывала."""
+    смотрел, что вообще написано в dest, и такая строка молча срабатывала.
+
+    Заодно ловим имена, которые Windows принимает, но хранит не так, как написано.
+    Это не выдумка на будущее: README прямо зовёт править models.json руками, а
+    файл на 30 ГиБ, ушедший в устройство CON, качается заново каждый запуск -
+    ошибки нет, файла нет, и понять по программе ничего нельзя.
+    """
     text = str(dest).replace("\\", "/")
     parts = [p for p in text.split("/") if p not in ("", ".")]
     if not parts or ".." in parts or ":" in text:
@@ -61,6 +84,23 @@ def dest_parts(dest):
             f"плохой dest в models.json: {dest!r} - "
             f"нужен относительный путь внутри папки ComfyUI, без .. и без буквы диска"
         )
+    for part in parts:
+        if part.rstrip(" .") != part:
+            raise ValueError(
+                f"плохой dest в models.json: {dest!r} - часть пути {part!r} "
+                f"кончается пробелом или точкой, Windows их срезает"
+            )
+        if part.split(".")[0].upper() in DEVICE_NAMES:
+            raise ValueError(
+                f"плохой dest в models.json: {dest!r} - {part!r} это имя устройства "
+                f"Windows, а не файла: запись в него пропадает молча"
+            )
+        bad = sorted(FORBIDDEN & set(part))
+        if bad:
+            raise ValueError(
+                f"плохой dest в models.json: {dest!r} - в {part!r} есть "
+                f"запрещённые в именах файлов знаки: {' '.join(map(repr, bad))}"
+            )
     return parts
 
 
@@ -205,13 +245,19 @@ def part_path(dest):
 def status(entry, root):
     """Недокачанный кусок лежит в .part, а не под настоящим именем: fetch()
     переименовывает файл только целиком. Пока сюда смотрел один dest, оборванная
-    закачка числилась как "ничего нет", хотя на диске уже были гигабайты."""
+    закачка числилась как "ничего нет", хотя на диске уже были гигабайты.
+
+    is_file(), а не exists(): папка с именем нужного файла - это не "битый файл"
+    на её размер, это отсутствующий файл и занятое место. Раньше такая папка
+    показывалась как «частично», .part рядом с ней не замечался вовсе, а запись
+    доходила до самого конца и падала сырым OSError уже после всех гигабайтов.
+    """
     dest = dest_path(root, entry["dest"])
-    if dest.exists():
+    if dest.is_file():
         actual = dest.stat().st_size
         return ("ok" if actual == entry["size"] else "damaged"), actual
     part = part_path(dest)
-    if part.exists():
+    if part.is_file():
         return "partial", part.stat().st_size
     return "missing", 0
 
@@ -276,7 +322,12 @@ def hf_token():
 
 
 def open_stream(url, offset):
-    req = urllib.request.Request(url, headers={"User-Agent": "InstallerModels/1.0"})
+    # identity в Accept-Encoding - не вежливость, а условие, при котором вообще
+    # работают и сверка размера, и докачка. Сожми прокси ответ на лету, и
+    # Content-Length станет размером архива, а не файла: программа объявила бы
+    # models.json устаревшим и назвала бы «правильный» размер, которого нет.
+    req = urllib.request.Request(url, headers={"User-Agent": "InstallerModels/1.0",
+                                               "Accept-Encoding": "identity"})
     token = hf_token()
     if token:
         req.add_header("Authorization", f"Bearer {token}")
@@ -313,7 +364,19 @@ def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None)
     """Download one file, resuming a leftover .part if there is one."""
     dest = Path(dest)
     part = part_path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    # Всё, что мешает положить файл на место, выясняем до первого байта из сети.
+    # Папка с именем файла, файл на месте папки models, том только для чтения -
+    # каждое из этого раньше всплывало последней строкой функции, сырым OSError
+    # и уже после того, как тридцать гигабайт скачаны впустую.
+    for path, what in ((dest, "destination"), (part, "part file")):
+        if path.exists() and not path.is_file():
+            raise RuntimeError(f"{what} {path} is not a file, move it out of the way")
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as err:
+        raise RuntimeError(f"cannot create folder {dest.parent}: {err}") from None
+
     note = on_note or (lambda text: None)
 
     def on_disk():
@@ -481,13 +544,29 @@ def fetch(url, dest, expected, on_progress=None, on_note=None, should_stop=None)
     except Cancelled:
         # Отмена могла прийти ровно на дописанном последнем куске. Готовый
         # файл из-за этого терять незачем - доводим его до места и только
-        # потом всплываем наверх.
+        # потом всплываем наверх. Не вышло переименовать - и ладно: .part
+        # никуда не денется, а разбираться с этим посреди отмены не время.
         if on_disk() == expected:
-            os.replace(part, dest)
+            try:
+                os.replace(part, dest)
+            except OSError:
+                pass
         raise
 
     actual = on_disk()
     if actual != expected:
         reason = f" (last error: {last_error})" if last_error else ""
         raise RuntimeError(f"got {human(actual)}, expected {human(expected)}{reason}")
-    os.replace(part, dest)
+    # Единственное место, где программа трогает файл под настоящим именем, и до
+    # сих пор оно было ничем не прикрыто. Windows не даёт переименовать поверх
+    # файла, который кто-то держит открытым, а держит его обычно запущенный
+    # ComfyUI: скачанные гигабайты кончались строкой [WinError 5] без единого
+    # слова о том, что закрыть. Файл при этом цел и лежит в .part.
+    try:
+        os.replace(part, dest)
+    except OSError as err:
+        raise RuntimeError(
+            f"downloaded in full, but cannot put it in place: {err} - "
+            f"close whatever keeps {dest.name} open (ComfyUI) and run again, "
+            f"nothing is lost"
+        ) from None

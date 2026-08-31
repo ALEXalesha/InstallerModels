@@ -14,7 +14,12 @@ HERE = Path(__file__).resolve().parent
 DIST = HERE / "dist"
 WORK = HERE / "build"
 APP = "InstallerModels"
-VERSION = "1.0.4"
+VERSION = "1.0.5"
+
+# README ссылается на docs/ и показывает оттуда же скриншоты. Рядом с exe этой
+# папки не было ни разу: у человека, который поставил программу установщиком,
+# половина ссылок в README вела в пустоту, а картинки не открывались вовсе.
+DOCS = "docs"
 
 TITLE_IN_GUI = r'window\.title\("([^"]*)"\)'
 TITLE_IN_NSI = r'!define WINTITLE "([^"]*)"'
@@ -143,13 +148,27 @@ def check_manifest():
             sys.exit(f"группа {name}: нет строки title_ru, окно покажет английское название")
 
 
+def check_docs():
+    """README едет рядом с exe и ссылается на docs/. Ссылка в никуда в самом
+    видном файле поставки - это не мелочь: собранную программу читают именно
+    по нему, а поправить его после сборки уже нельзя, только пересобрать."""
+    readme = (HERE / "README.md").read_text(encoding="utf-8")
+    missing = sorted({
+        link for link in re.findall(r"\(({}/[^)]+)\)".format(DOCS), readme)
+        if not (HERE / link).exists()
+    })
+    if missing:
+        sys.exit("README ссылается на то, чего нет: " + ", ".join(missing))
+
+
 def preflight():
     """Все проверки - до сборки. Раньше кодировка setup.nsi проверялась после
     двух прогонов PyInstaller, то есть через пару минут работы впустую."""
     for name in ("gui.py", "core.py", "tests.py", "models.json",
-                 "icon.ico", "setup.nsi", "README.md"):
+                 "icon.ico", "setup.nsi", "README.md", DOCS):
         if not (HERE / name).exists():
             sys.exit(f"не хватает файла {name}")
+    check_docs()
     check_manifest()
     check_nsi_encoding()
     check_window_title()
@@ -162,6 +181,20 @@ def folder_size(path):
     return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
 
 
+def lay_out_extras(where):
+    """Кладёт рядом с exe то, что читает человек, а не программа.
+
+    models.json ещё и перебивает встроенный в exe - на этом держится вся
+    правка списка моделей без пересборки. README до сих пор клался один, без
+    docs/, хотя ссылается на docs/build.md, docs/models.md и docs/lmstudio.md
+    и показывает оттуда два скриншота. Установщик кладёт всю папку целиком,
+    так что в собранной программе README теперь читается как в репозитории.
+    """
+    for name in ("models.json", "README.md"):
+        shutil.copy2(HERE / name, where / name)
+    shutil.copytree(HERE / DOCS, where / DOCS, dirs_exist_ok=True)
+
+
 def main():
     preflight()
 
@@ -172,13 +205,11 @@ def main():
 
     portable = DIST / "portable"
     pyinstaller("--onefile", portable, WORK / "onefile")
-    for extra in ("models.json", "README.md"):
-        shutil.copy2(HERE / extra, portable / extra)
+    lay_out_extras(portable)
 
     payload = DIST / "app"
     pyinstaller("--onedir", payload, WORK / "onedir")
-    shutil.copy2(HERE / "models.json", payload / APP / "models.json")
-    shutil.copy2(HERE / "README.md", payload / APP / "README.md")
+    lay_out_extras(payload / APP)
 
     # setup.nsi берёт файлы по жёстко записанному пути. Разъедется он с тем, что
     # выложил PyInstaller, - makensis соберёт установщик из воздуха и не пожалуется.

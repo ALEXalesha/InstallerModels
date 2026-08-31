@@ -11,6 +11,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from core import (
     Cancelled,
+    QueueProgress,
     app_dir,
     comfy_root,
     dest_path,
@@ -392,8 +393,7 @@ class App(ttk.Frame):
         self.total_bar.configure(value=0)
         self.log(f"начинаю: {len(job)} файлов, {size_ru(total)}")
 
-        self.worker = threading.Thread(target=self.run_job,
-                                       args=(job, root, total, need), daemon=True)
+        self.worker = threading.Thread(target=self.run_job, args=(job, root), daemon=True)
         self.worker.start()
 
     def cancel(self):
@@ -406,29 +406,20 @@ class App(ttk.Frame):
         part = part_path(dest_path(root, entry["dest"]))
         return part.stat().st_size if part.exists() else 0
 
-    def run_job(self, job, root, total, need):
+    def run_job(self, job, root):
         """Работает в отдельном потоке. Общается с окном только через очередь.
 
-        total - полный объём очереди, need - сколько из него ещё предстоит вытянуть
-        из сети. Раньше в поток уезжало только total, и обе цифры окна врали после
-        обрыва: полоска «всего» начинала с нуля там, где на диске уже лежало почти
-        всё, а время до конца считалось по всему объёму и обещало часы вместо минут.
+        Вся арифметика полосок живёт в core.QueueProgress: тут остаётся цикл,
+        обработка исходов и отправка событий. Раньше счёт был размазан по этому
+        методу, и проверить его было нечем - ни вызвать без окна, ни вызвать без
+        сети. Чинился он от этого дважды по живому.
 
         Событие done уходит через finally: без этого любая неожиданная ошибка
         оставила бы окно с заблокированной кнопкой и без единого объяснения.
         """
         put = self.events.put
-
-        # Сколько уже лежит в .part у файлов, до которых очередь ещё не дошла.
-        # ahead[i] - сумма по всем файлам после i-го, снятая один раз на старте.
-        ahead, tail = [], 0
-        for entry in reversed(job):
-            ahead.append(tail)
-            tail += self.part_size(root, entry)
-        ahead.reverse()
-
-        finished_bytes = 0   # объём файлов, с которыми очередь уже закончила
-        fetched = 0          # байты, вытянутые из сети в этот заход
+        bars = QueueProgress([e["size"] for e in job],
+                             [self.part_size(root, e) for e in job])
         failed = []
         cancelled = False
 
@@ -436,17 +427,10 @@ class App(ttk.Frame):
             for n, entry in enumerate(job, 1):
                 put(("file", f"[{n}/{len(job)}] {entry['dest']}  ({size_ru(entry['size'])})"))
                 put(("log", f"качаю {entry['dest']} из {entry['repo']}"))
-                had = self.part_size(root, entry)
-                rest = ahead[n - 1]
+                bars.start_file(n - 1)
 
-                def on_progress(done, size, speed, base=finished_bytes, rest=rest,
-                                had=had, got=fetched):
-                    # done приходит вместе с уже лежавшими байтами, поэтому из сети
-                    # за этот заход взято ровно done - had. При перезапуске файла с
-                    # нуля done становится меньше had, и тогда это просто ноль.
-                    pulled = got + max(done - had, 0)
-                    put(("progress", (done, size, base + rest + done, total, speed,
-                                      need - pulled)))
+                def on_progress(done, size, speed):
+                    put(("progress", bars.advance(done) + (speed,)))
 
                 try:
                     fetch(
@@ -459,27 +443,17 @@ class App(ttk.Frame):
                     )
                 except Cancelled:
                     put(("log", "остановлено, недокачанный кусок сохранён для докачки"))
-                    fetched += max(self.part_size(root, entry) - had, 0)
+                    bars.cancel_file(self.part_size(root, entry))
                     cancelled = True
                     break
                 except Exception as err:
                     put(("log", f"ОШИБКА {entry['dest']}: {err}"))
                     failed.append(entry["dest"])
-                    # Сломавшийся файл не дорос до своего размера, и засчитывать его
-                    # целиком нельзя: полоска «файл» показывала полную заливку ровно
-                    # на том файле, про который в логе написано ОШИБКА.
-                    got = self.part_size(root, entry)
-                    fetched += max(got - had, 0)
-                    finished_bytes += got
-                    put(("progress", (got, entry["size"], finished_bytes + rest,
-                                      total, 0, need - fetched)))
+                    put(("progress", bars.fail_file(self.part_size(root, entry)) + (0,)))
                     continue
 
                 put(("log", f"готово {entry['dest']}"))
-                fetched += max(entry["size"] - had, 0)
-                finished_bytes += entry["size"]
-                put(("progress", (entry["size"], entry["size"], finished_bytes + rest,
-                                  total, 0, need - fetched)))
+                put(("progress", bars.finish_file() + (0,)))
         except Cancelled:
             cancelled = True
         except Exception as err:
@@ -494,7 +468,9 @@ class App(ttk.Frame):
         elif kind == "file":
             self.file_label.configure(text=payload)
         elif kind == "progress":
-            done, size, overall, total, speed, left = payload
+            # Порядок полей задаёт core.Frame, скорость приклеивается последней:
+            # её знает не арифметика очереди, а fetch().
+            done, size, overall, total, left, speed = payload
             self.file_bar.configure(value=done * 1000 / size if size else 0)
             self.total_bar.configure(value=overall * 1000 / total if total else 0)
             if speed > 0:

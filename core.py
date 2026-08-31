@@ -8,6 +8,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import namedtuple
 from pathlib import Path
 from urllib.parse import quote
 
@@ -303,6 +304,83 @@ def needed_bytes(queue, root):
         have = part.stat().st_size if part.exists() else 0
         total += max(entry["size"] - have, 0)
     return total
+
+
+Frame = namedtuple("Frame", "done size overall total left")
+
+
+class QueueProgress:
+    """Арифметика двух полосок: по текущему файлу и по всей очереди.
+
+    Жила внутри метода потока в gui.py - там её нельзя было ни вызвать, ни
+    проверить, и чинилась она дважды по живому. Сначала в поток уезжал один
+    полный объём очереди, и после обрыва полоска «всего» начинала с нуля там,
+    где на диске лежало почти всё, а время до конца считалось по всему объёму и
+    обещало часы вместо минут. Потом оказалось, что сломавшийся файл заливает
+    свою полоску до конца ровно там, где в логе написано ОШИБКА.
+
+    Считает она пять чисел и ничего не знает ни про tkinter, ни про потоки:
+
+      done, size - сколько лежит у текущего файла и сколько ему положено;
+      overall, total - то же по всей очереди, вместе с уже лежавшим в .part;
+      left - сколько ещё лететь по сети. Не то же, что total - overall:
+             недокачанное уже на диске и времени больше не займёт.
+    """
+
+    def __init__(self, sizes, on_disk):
+        self.sizes = list(sizes)
+        self.on_disk = list(on_disk)
+        self.total = sum(self.sizes)
+        self.need = sum(max(s - d, 0) for s, d in zip(self.sizes, self.on_disk))
+        # ahead[i] - сколько уже лежит в .part у файлов ПОСЛЕ i-го. Снимается
+        # один раз на старте: очередь до них ещё не дошла, но место они занимают
+        # и в полоске «всего» участвуют с первой секунды.
+        self.ahead, tail = [], 0
+        for have in reversed(self.on_disk):
+            self.ahead.append(tail)
+            tail += have
+        self.ahead.reverse()
+        self.index = 0
+        self.finished = 0   # объём файлов, с которыми очередь уже закончила
+        self.fetched = 0    # байты, вытянутые из сети за этот заход
+        self.had = self.on_disk[0] if self.on_disk else 0
+
+    def start_file(self, index):
+        self.index = index
+        self.had = self.on_disk[index]
+
+    def advance(self, done):
+        """Пришёл кусок. done - сколько всего лежит у текущего файла.
+
+        Из сети за этот заход взято ровно done - had: остальное лежало и раньше.
+        При перезапуске файла с нуля done становится меньше had, и тогда это ноль.
+        """
+        return self._frame(done, self.sizes[self.index],
+                           self.finished + self.ahead[self.index] + done,
+                           self.fetched + max(done - self.had, 0))
+
+    def finish_file(self):
+        size = self.sizes[self.index]
+        self.fetched += max(size - self.had, 0)
+        self.finished += size
+        return self._frame(size, size, self.finished + self.ahead[self.index], self.fetched)
+
+    def fail_file(self, got):
+        """Файл не дорос до своего размера, и засчитывать его целиком нельзя."""
+        self.fetched += max(got - self.had, 0)
+        self.finished += got
+        return self._frame(got, self.sizes[self.index],
+                           self.finished + self.ahead[self.index], self.fetched)
+
+    def cancel_file(self, got):
+        self.fetched += max(got - self.had, 0)
+
+    def _frame(self, done, size, overall, pulled):
+        # Оба потолка не украшение: полоска, уехавшая за свой максимум, и
+        # отрицательный остаток, из которого потом считают время, - это то, что
+        # человек видит в окне. Пусть лучше упрётся, чем покажет чепуху.
+        return Frame(done, size, min(overall, self.total), self.total,
+                     max(self.need - pulled, 0))
 
 
 # http.client.IncompleteRead и родня не наследуются от OSError, а на chunked

@@ -441,8 +441,107 @@ def manifest_answers_only_with_valueerror():
     return total
 
 
+# ------------------------------------------------- арифметика полосок окна
+
+SHAPES = (1000, 2500, 700)                    # размеры файлов в очереди
+LYING = (0.0, 0.3, 0.9)                       # какая доля уже лежит в .part
+ENDINGS = ("готово", "сорвалось на нуле", "сорвалось на 40%", "отмена на 60%")
+
+
+def bars_never_show_nonsense():
+    """Перебор по очередям: сколько файлов, сколько у каждого уже лежит, чем
+    каждый кончился. В каждом кадре - границы, и отдельно три поломки, которые
+    в этой арифметике уже случались.
+
+    Считать её раньше было нечем: она жила внутри метода потока в gui.py, и
+    чтобы до неё добраться, нужны были и окно, и сеть. Оттого и чинилась дважды
+    по живому, на глаз.
+    """
+    broken, total_cases = [], 0
+
+    for count in (1, 2, 3):
+        sizes = list(SHAPES[:count])
+        for fracs in product(LYING, repeat=count):
+            for endings in product(ENDINGS, repeat=count):
+                total_cases += 1
+                on_disk = [int(size * frac) for size, frac in zip(sizes, fracs)]
+                bars = core.QueueProgress(sizes, on_disk)
+                label = f"файлов={count} лежит={fracs} исход={endings}"
+
+                frames, stopped = [], False
+                for index, size in enumerate(sizes):
+                    bars.start_file(index)
+                    frames.append(("первый кусок", bars.advance(on_disk[index])))
+                    frames.append(("середина", bars.advance(max(on_disk[index],
+                                                                int(size * 0.7)))))
+                    ending = endings[index]
+                    if ending == "готово":
+                        frames.append((ending, bars.finish_file()))
+                    elif ending == "сорвалось на нуле":
+                        frames.append((ending, bars.fail_file(0)))
+                    elif ending == "сорвалось на 40%":
+                        frames.append((ending, bars.fail_file(int(size * 0.4))))
+                    else:
+                        bars.cancel_file(int(size * 0.6))
+                        stopped = True
+                        break
+
+                for what, frame in frames:
+                    # Полоска, уехавшая за свой максимум, и отрицательный
+                    # остаток, из которого считают время, - это то, что человек
+                    # видит в окне. Ни одно из пяти чисел не имеет права
+                    # вылезти за свои берега ни в одной клетке.
+                    if not 0 <= frame.done <= frame.size:
+                        broken.append(f"{label}: {what}: файл {frame.done} из {frame.size}")
+                    if not 0 <= frame.overall <= frame.total:
+                        broken.append(f"{label}: {what}: всего {frame.overall} "
+                                      f"из {frame.total}")
+                    if not 0 <= frame.left <= bars.need:
+                        broken.append(f"{label}: {what}: осталось {frame.left} "
+                                      f"при нужных {bars.need}")
+
+                # Поломка первая: полоска «всего» начинала с нуля там, где на
+                # диске уже лежало почти всё, - в поток уезжал только полный
+                # объём очереди. Самый первый кадр обязан показывать ровно то,
+                # что уже лежит.
+                start = frames[0][1]
+                if start.overall != bars.total - bars.need:
+                    broken.append(f"{label}: старт с {start.overall}, "
+                                  f"а на диске лежит {bars.total - bars.need}")
+
+                # Поломка вторая: время до конца считалось по всему объёму и
+                # обещало часы вместо минут. В первом кадре лететь по сети
+                # осталось ровно всё, что не лежит на диске, - не больше.
+                if start.left != bars.need:
+                    broken.append(f"{label}: на старте осталось {start.left}, "
+                                  f"а тянуть {bars.need}")
+
+                # Поломка третья: сломавшийся файл заливал свою полоску до
+                # конца - ровно тот файл, про который в логе написано ОШИБКА.
+                for what, frame in frames:
+                    if what == "сорвалось на 40%" and frame.done >= frame.size:
+                        broken.append(f"{label}: сорвавшийся файл залит целиком")
+
+                # Всё дошло до конца - обе полоски полны, тянуть больше нечего.
+                if not stopped and all(e == "готово" for e in endings):
+                    last = frames[-1][1]
+                    if (last.overall, last.left) != (last.total, 0):
+                        broken.append(f"{label}: в конце {last.overall} из "
+                                      f"{last.total}, осталось {last.left}")
+
+    if broken:
+        shown = "\n        ".join(broken[:25])
+        tail = f"\n        ... и ещё {len(broken) - 25}" if len(broken) > 25 else ""
+        raise AssertionError(
+            f"полоски врут в {len(broken)} случаях на {total_cases} очередях"
+            f"\n        {shown}{tail}"
+        )
+    return total_cases
+
+
 CASES = [download_survives_every_corner,
          cancel_never_loses_anything,
+         bars_never_show_nonsense,
          manifest_answers_only_with_valueerror]
 
 

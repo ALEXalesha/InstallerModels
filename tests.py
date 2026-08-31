@@ -6,6 +6,7 @@
 которому можно велеть рвать соединение когда захочется.
 """
 
+import gc
 import http.server
 import json
 import os
@@ -38,6 +39,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     mode = "whole"
     hits = 0
     seen = {}   # заголовки последнего запроса
+    # Потолок с большим запасом: самая длинная честная проверка тут - докачка
+    # кусками по 7000 байт, это 15 подходов.
+    bound = 40
 
     def log_message(self, *args):
         pass
@@ -45,6 +49,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         Handler.hits += 1
         Handler.seen = dict(self.headers)
+
+        # Сломай в core.py счётчик перезапусков - и проверка на вечный круг
+        # закрутится вечно сама. Это хуже проваленной проверки: build.py гоняет
+        # прогон перед сборкой и повис бы навсегда, без единого сообщения.
+        # У зависания нет кода возврата. Обрываем неретраибельным 404 - и
+        # зависание превращается во внятный провал.
+        if Handler.hits > Handler.bound:
+            self.reply(404)
+            return
+
         span = self.headers.get("Range")
         start = int(span.split("=")[1].split("-")[0]) if span else 0
 
@@ -605,6 +619,430 @@ def the_browsed_folder_wins_over_the_manifest():
             os.environ.pop("LOCALAPPDATA", None)
         else:
             os.environ["LOCALAPPDATA"] = was
+
+
+# ------------------------------------------------------- консоль, сборка, NSIS
+
+@case
+def the_command_line_answers_every_flag():
+    """Разбор команды не проверялся никак: под проверкой была пятая часть
+    install.py, и вся она приходилась на общий с окном core.py. Коды возврата
+    расписаны в README, по ним пишут скрипты - а сверял их до сих пор никто."""
+    import contextlib
+    import io
+
+    import install
+
+    root = TMP / "cli-root"
+    root.mkdir(exist_ok=True)
+    было_argv, было_root = sys.argv, os.environ.get("COMFYUI_ROOT")
+    os.environ["COMFYUI_ROOT"] = str(root)
+
+    # команда -> код возврата, что обязано быть в выводе, чего быть не должно
+    table = [
+        ([],                     0, ["usage:", "everything:"],            []),
+        (["--list"],             0, ["everything:", "ltx"],               []),
+        (["--lmstudio"],         0, ["lms get", "model key in LM Studio"], []),
+        (["--check"],            1, ["sdxl", "hunyuan3d", "need downloading"], []),
+        (["--check", "sdxl"],    1, ["sdxl"],                             ["hunyuan3d"]),
+        (["--check", "ltxx"],    1, ["unknown group"],                    []),
+        (["--dry-run", "sdxl"],  0, ["to download", "sdxl_vae"],          []),
+        (["нетакой"],            1, ["unknown group", "available:"],      []),
+        (["--root", str(TMP / "нет-папки"), "sdxl"], 1, ["folder not found"], []),
+    ]
+    try:
+        for argv, code, must, must_not in table:
+            out = io.StringIO()
+            sys.argv = ["install.py"] + argv
+            with contextlib.redirect_stdout(out):
+                got = install.main()
+            text = out.getvalue()
+            assert got == code, f"{argv}: код {got}, ждали {code}\n{text}"
+            for needle in must:
+                assert needle in text, f"{argv}: в выводе нет {needle!r}\n{text}"
+            for needle in must_not:
+                assert needle not in text, f"{argv}: в выводе лишнее {needle!r}\n{text}"
+    finally:
+        sys.argv = было_argv
+        if было_root is None:
+            os.environ.pop("COMFYUI_ROOT", None)
+        else:
+            os.environ["COMFYUI_ROOT"] = было_root
+
+
+@case
+def the_command_line_downloads_reports_and_stops_early():
+    """Установка из консоли от начала до конца: скачали, повторили, сломали.
+
+    Раньше эта дорога не проходилась ни разу: проверялся core.fetch, а всё, что
+    вокруг него в install.py - очередь, пропуск уже готового, проверка места,
+    список неудачных и код возврата - держалось на честном слове.
+    """
+    import contextlib
+    import io
+
+    import install
+
+    root = TMP / "cli-install"
+    root.mkdir(exist_ok=True)
+    manifest = {"comfyui_root": str(root), "groups": {"g": {"title": "T", "files": [
+        {"dest": "models/vae/cli.bin", "repo": "r", "path": "p", "size": SIZE}]}}}
+    было_url, было_shutil = install.hf_url, install.shutil
+
+    def run(dry=False):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = install.cmd_install(manifest, root, ["g"], dry)
+        return code, out.getvalue()
+
+    try:
+        install.hf_url = lambda repo, path: URL
+
+        serve("whole")
+        code, text = run()
+        assert code == 0, text
+        assert (root / "models/vae/cli.bin").read_bytes() == BODY, "файл не лёг на место"
+
+        # Второй заход по той же группе: качать нечего, и это не ошибка.
+        code, text = run()
+        assert code == 0 and "nothing to download" in text, text
+        assert "skip (already there)" in text, text
+
+        # Сломанный репозиторий: код 1, список неудачных и совет повторить.
+        serve("gone")
+        (root / "models/vae/cli.bin").unlink()
+        code, text = run()
+        assert code == 1, text
+        assert "FAILED" in text and "run the same command again" in text, text
+
+        # Мало места - в сеть не идём вовсе.
+        serve("whole")
+        Handler.hits = 0
+
+        class Полный:
+            @staticmethod
+            def disk_usage(path):
+                return type("U", (), {"free": 0})()
+
+        install.shutil = Полный
+        code, text = run()
+        assert code == 1 and "not enough free space" in text, text
+        assert Handler.hits == 0, "места нет, а в сеть всё равно сходили"
+    finally:
+        install.hf_url, install.shutil = было_url, было_shutil
+
+
+@case
+def the_progress_line_never_breaks():
+    """Полоска в консоли рисуется поверх самой себя, и её ширина - часть
+    рисунка. "999999:00" при смешной скорости в начале файла и "-1:-30", когда
+    done обгонял total, разъезжали строку и оставляли на экране мусор."""
+    import contextlib
+    import io
+    import re as regex
+
+    import install
+
+    bar = install.Progress()
+    hard = [(0, SIZE, 0.001),        # скорость по первым байтам, время в сутках
+            (SIZE, SIZE, 1e9),       # мгновенно
+            (SIZE + 5000, SIZE, 100),  # .part больше, чем сказано в манифесте
+            (0, 0, 0),               # пустая очередь
+            (50, 100, -5)]           # отрицательная скорость
+    for done, total, speed in hard:
+        bar.next_step = 0            # заставляем печатать каждый раз
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            bar.update(done, total, speed)
+        line = out.getvalue()
+        assert "ETA" in line, f"{done}/{total}: строка без ETA: {line!r}"
+        clock = line.split("ETA")[1].strip().split()[0]
+        assert regex.match(r"^\d{1,3}:\d{2}$", clock), \
+            f"{done}/{total} на скорости {speed}: часы {clock!r} разъедут строку"
+
+
+@case
+def the_build_refuses_a_broken_project():
+    """Проверки перед сборкой сами не проверялись ничем.
+
+    Их шесть, и каждая стоит между кривым файлом и собранным exe. Проверка,
+    которая молча пропускает то, что должна ловить, хуже отсутствующей: на неё
+    рассчитывают. Тут они гоняются на целой копии проекта, а потом на такой же,
+    но подпорченной ровно в том месте, за которое каждая отвечает.
+    """
+    import build
+
+    good = TMP / "проект"
+    shutil.rmtree(good, ignore_errors=True)
+    shutil.copytree(HERE, good, ignore=shutil.ignore_patterns(
+        "dist", "build", "__pycache__", ".git", ".remember"))
+
+    было = build.HERE
+    try:
+        build.HERE = good
+        for check in (build.check_docs, build.check_nsi_encoding,
+                      build.check_window_title, build.check_version,
+                      build.check_manifest):
+            check()   # на целом проекте все обязаны молчать
+
+        def без_title_ru(raw):
+            tree = json.loads(raw.decode("utf-8"))
+            for group in tree["groups"].values():
+                group.pop("title_ru", None)
+            return json.dumps(tree, ensure_ascii=False).encode("utf-8")
+
+        def без_lmstudio(raw):
+            tree = json.loads(raw.decode("utf-8"))
+            tree.pop("lmstudio", None)
+            return json.dumps(tree, ensure_ascii=False).encode("utf-8")
+
+        damage = [
+            ("README.md", lambda raw: raw + "\n[дыра](docs/нет-такого.md)\n".encode("utf-8"),
+             build.check_docs, "ссылка из README в никуда"),
+            ("setup.nsi", lambda raw: raw[3:],
+             build.check_nsi_encoding, "у setup.nsi отняли BOM"),
+            ("setup.nsi", lambda raw: raw.replace(
+                f'!define VERSION "{build.VERSION}"'.encode("utf-8"),
+                b'!define VERSION "0.0.0"'),
+             build.check_version, "версии разъехались"),
+            ("gui.py", lambda raw: raw.replace(
+                b'window.title("', b'window.title("\xd0\xa7\xd1\x83\xd0\xb6\xd0\xbe\xd0\xb5 '),
+             build.check_window_title, "заголовок окна разъехался с установщиком"),
+            ("models.json", без_title_ru, build.check_manifest, "у групп нет title_ru"),
+            ("models.json", без_lmstudio, build.check_manifest, "пропал раздел lmstudio"),
+        ]
+        for name, mangle, check, what in damage:
+            path = good / name
+            original = path.read_bytes()
+            try:
+                path.write_bytes(mangle(original))
+                try:
+                    check()
+                except SystemExit:
+                    continue
+                raise AssertionError(f"{what}: проверка промолчала и пустила бы это в exe")
+            finally:
+                path.write_bytes(original)
+    finally:
+        build.HERE = было
+        shutil.rmtree(good, ignore_errors=True)
+
+
+@case
+def the_window_builds_and_survives_every_event():
+    """Окно не проверялось ни одной строкой: 332 строки, ноль.
+
+    Арифметика полосок уехала в core.QueueProgress и перебирается отдельно, а
+    тут остаётся обвязка: сборка виджетов, насос событий, три исхода закачки и
+    замок на кнопках. Ломается она молча - окно просто не открывается или
+    остаётся с заблокированной кнопкой, и узнать об этом можно было только
+    запустив exe руками после сборки.
+
+    Диалоги подменяем: настоящий messagebox остановил бы прогон намертво.
+    """
+    import tkinter as tk
+
+    import gui
+
+    показано = []
+
+    class Диалоги:
+        @staticmethod
+        def showinfo(title, text=""):
+            показано.append(("инфо", title))
+
+        @staticmethod
+        def showerror(title, text=""):
+            показано.append(("ошибка", title))
+
+        @staticmethod
+        def showwarning(title, text=""):
+            показано.append(("предупреждение", title))
+
+        @staticmethod
+        def askyesno(title, text=""):
+            показано.append(("вопрос", title))
+            return False
+
+    root = TMP / "gui-root"
+    root.mkdir(exist_ok=True)
+    было_окно, было_root = gui.messagebox, os.environ.get("COMFYUI_ROOT")
+    os.environ["COMFYUI_ROOT"] = str(root)
+    gui.messagebox = Диалоги
+
+    window = None
+    try:
+        try:
+            window = tk.Tk()
+        except tk.TclError as err:
+            raise AssertionError(f"Tk не поднялся, окно не собрать: {err}") from None
+        window.withdraw()
+        app = gui.App(window)
+
+        # Собралось ли то, что описано в models.json.
+        assert set(app.rows) == set(app.manifest["groups"]), "строки групп разъехались"
+        app.select(True)
+        assert app.chosen_keys() == list(app.manifest["groups"])
+        app.select_missing()
+        app.select(False)
+        assert app.chosen_keys() == []
+
+        # Папка есть, папки нет - оба вида должны переживаться без исключений.
+        app.refresh()
+        assert "свободно" in app.disk_label.cget("text")
+        app.root_path.set(str(TMP / "нет-такой-папки"))
+        app.apply_typed_root()
+        assert app.disk_label.cget("text") == "папка не найдена"
+        app.root_path.set(str(root))
+        app.apply_typed_root()
+
+        # Насос событий обязан пережить что угодно: пока он крутится, окно живо.
+        bars = core.QueueProgress([SIZE, SIZE], [0, 0])
+        bars.start_file(0)
+        app.events.put(("log", "строка в лог"))
+        app.events.put(("file", "какой-то файл"))
+        app.events.put(("progress", bars.advance(SIZE // 2) + (1000.0,)))
+        app.events.put(("мусор, которого не бывает", None))
+        app.drain_events()
+        assert app.file_bar["value"] == 500, app.file_bar["value"]
+        assert "осталось" in app.speed_label.cget("text")
+
+        # Три исхода закачки: успех, часть не скачалась, отмена с провалами.
+        # Перед каждым запираем окно ровно так, как это делает start(). Без
+        # этого проверка «кнопка разблокировалась» ничего не значит: она и не
+        # была заперта, и убери из finish_job строку, которая её отпускает, -
+        # проверка всё равно останется зелёной. Так и вышло с первого раза.
+        показано.clear()
+        for failed, cancelled in (([], False),
+                                  (["models/vae/x.bin"], False),
+                                  (["models/vae/x.bin"], True)):
+            app.lock_controls(True)
+            app.download_button.configure(state="disabled")
+            app.cancel_button.configure(state="normal")
+            app.finish_job(failed, cancelled)
+            # str() тут обязателен: ttk отдаёт из cget не строку, а объект Tcl,
+            # и сравнение с "normal" молча оказывается ложным всегда.
+            assert str(app.download_button.cget("state")) == "normal", \
+                "кнопка «Скачать» осталась запертой - окно больше ничего не умеет"
+            assert str(app.cancel_button.cget("state")) == "disabled", \
+                "«Отмена» осталась живой, хотя качать уже нечего"
+        assert [kind for kind, _ in показано] == ["инфо", "предупреждение", "предупреждение"], \
+            показано
+
+        # Замок на время закачки: галочки и кнопки выбора запираются вместе.
+        app.lock_controls(True)
+        assert str(app.browse_button.cget("state")) == "disabled"
+        assert all(str(r.box.cget("state")) == "disabled" for r in app.rows.values())
+        app.lock_controls(False)
+        assert str(app.browse_button.cget("state")) == "normal"
+
+        # Старт без выбора и старт в несуществующую папку: оба обязаны
+        # объясниться диалогом, а не уйти качать.
+        показано.clear()
+        app.start()
+        assert показано == [("инфо", "Нечего качать")], показано
+        показано.clear()
+        app.select(True)
+        app.root_path.set(str(TMP / "нет-такой-папки"))
+        app.start()
+        assert показано == [("ошибка", "Папка не найдена")], показано
+        assert app.worker is None, "ушёл качать в несуществующую папку"
+
+        app.closing = True
+    finally:
+        gui.messagebox = было_окно
+        if было_root is None:
+            os.environ.pop("COMFYUI_ROOT", None)
+        else:
+            os.environ["COMFYUI_ROOT"] = было_root
+        if window is not None:
+            # Переменные Tk (BooleanVar галочек, StringVar пути) на разрушении
+            # окна не исчезают - их прибирает сборщик мусора, уже когда Tk
+            # мёртв, и каждая печатает "main thread is not in main loop".
+            # Прогон от этого не падает, но экран засыпается трассировками, а
+            # код возврата становится ненадёжным - и сборка отказывается идти.
+            # Роняем их руками, пока Tk ещё жив.
+            for row in app.rows.values():
+                row.picked = None
+            app.rows.clear()
+            app.root_path = None
+            gc.collect()
+            window.destroy()
+            gc.collect()
+
+
+@case
+def the_installer_script_holds_together():
+    """setup.nsi сверялся на BOM, заголовок и версию - три строки из ста
+    девяноста. Остальное держалось на том, что makensis не ругается, а он и не
+    обязан: зовущий несуществующую функцию скрипт собирается молча.
+    """
+    import re as regex
+
+    text = (HERE / "setup.nsi").read_text(encoding="utf-8-sig")
+    lines = text.splitlines()
+
+    # Каждый Call обязан кому-то соответствовать. Макрос RunningCheck порождает
+    # сразу две функции - обычную и un.-шную, для деинсталлятора.
+    defined = set()
+    for name in regex.findall(r"^Function\s+(\S+)", text, regex.M):
+        if "${un}" in name:
+            defined |= {name.replace("${un}", ""), name.replace("${un}", "un.")}
+        else:
+            defined.add(name)
+    called = set(regex.findall(r"^\s*Call\s+(\S+)", text, regex.M))
+    assert called and called <= defined, f"зовут несуществующее: {sorted(called - defined)}"
+
+    # Рекурсивное удаление папки установки обязано стоять под защитой: $INSTDIR
+    # приходит из реестра, и RMDir /r по чужому пути - это уже не удаление
+    # программы. Проверяем не текст комментария, а строку прямо перед ним.
+    guarded = 0
+    for n, line in enumerate(lines):
+        if line.strip() != 'RMDir /r "$INSTDIR"':
+            continue
+        before = ""
+        for previous in reversed(lines[:n]):
+            if previous.strip() and not previous.strip().startswith(";"):
+                before = previous.strip()
+                break
+        assert before.startswith('IfFileExists "$INSTDIR\\${APP}.exe"'), \
+            f"строка {n + 1}: RMDir /r по $INSTDIR без проверки, что папка наша: {before!r}"
+        guarded += 1
+    assert guarded == 1, f"ожидали одно защищённое RMDir /r по $INSTDIR, нашли {guarded}"
+
+    # Страница выбора папки обязана иметь проверку, иначе установщика пустят в
+    # чужую непустую папку, а деинсталлятор потом снесёт её целиком.
+    заметки = [ln.strip() for ln in lines
+               if ln.strip() and not ln.strip().startswith(";")]
+    where = заметки.index("!insertmacro MUI_PAGE_DIRECTORY")
+    assert заметки[where - 1] == "!define MUI_PAGE_CUSTOMFUNCTION_LEAVE CheckInstallDir", \
+        f"перед страницей выбора папки нет проверки, а есть {заметки[where - 1]!r}"
+
+    # Описания у разделов: и раздел, и строка перевода обязаны существовать.
+    sections = set(regex.findall(r'^Section\s+"[^"]*"\s+(\w+)', text, regex.M))
+    described = set(regex.findall(r"MUI_DESCRIPTION_TEXT \$\{(\w+)\}", text))
+    assert described <= sections, f"описание у несуществующего раздела: {described - sections}"
+    langstrings = set(regex.findall(r"^LangString\s+(\w+)", text, regex.M))
+    used = {name for name in regex.findall(r"\$\((\w+)\)", text) if name.startswith("DESC_")}
+    assert used <= langstrings, f"нет перевода для: {sorted(used - langstrings)}"
+
+    # Запомненная папка ComfyUI лежит вне $INSTDIR, и деинсталлятор стирает её
+    # по жёстко записанному пути. Поменяется settings_path() в core.py - файл
+    # переживёт удаление и всплывёт при следующей установке как чужая настройка.
+    # Обе стороны выводим, а не вписываем: иначе проверка сама и разъедется.
+    app = regex.search(r'!define APP\s+"([^"]*)"', text).group(1)
+    было = os.environ.get("LOCALAPPDATA")
+    os.environ["LOCALAPPDATA"] = "C:/AppData"
+    try:
+        tail = core.settings_path().as_posix()[len("C:/AppData/"):]
+    finally:
+        if было is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = было
+    assert tail == f"{app}/settings.json", f"core.py пишет настройки в {tail}"
+    assert 'Delete "$LOCALAPPDATA\\${APP}\\settings.json"' in text, \
+        "деинсталлятор не стирает запомненную папку ComfyUI"
 
 
 # ------------------------------------------------------------------- прогон

@@ -1010,6 +1010,19 @@ def a_missing_folder_makes_the_program_look_for_comfyui():
     assert core.find_comfy([пустая, голые_модели, настоящий]) == настоящий
     assert core.find_comfy([пустая, голые_модели]) is None
 
+    # Сам список обычных мест: в остальных проверках он подменяется своим, и
+    # настоящий не порождался ни разу. Упади он - автопоиск сломался бы на
+    # живой машине, а прогон остался бы зелёным.
+    места = list(core.comfy_candidates())
+    assert места, "список обычных мест пуст"
+    assert all(p.name == "ComfyUI" for p in места), [p.name for p in места]
+    хвосты = {p.parent.name for p in места}
+    assert "Documents" in хвосты, хвосты
+    assert "ComfyUI_windows_portable" in хвосты, "portable-раскладку не ищем"
+    assert len(места) == len(set(места)), "в списке есть повторы"
+    # И проход по нему целиком не должен ни падать, ни зависать на чужих дисках.
+    core.find_comfy()
+
     # Записанный путь никуда не ведёт - ищем. Ведёт - не трогаем ничего.
     #
     # Поиск подменяем: настоящий обходит обычные места, и на машине, где ComfyUI

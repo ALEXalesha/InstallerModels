@@ -40,7 +40,7 @@ Portable: PyInstaller в режиме `--onefile`. Получается один
 ```
 dist/portable/InstallerModels.exe        11.3 МБ
 dist/app/InstallerModels/                26.3 МБ
-dist/InstallerModels-Setup-1.0.5.exe      8.6 МБ
+dist/InstallerModels-Setup-1.0.6.exe      8.6 МБ
 ```
 
 ## Проверки до сборки
@@ -152,7 +152,7 @@ Portable запускается и показывает правильный п�
 Тихая установка и удаление для быстрой проверки:
 
 ```bash
-dist\InstallerModels-Setup-1.0.5.exe /S
+dist\InstallerModels-Setup-1.0.6.exe /S
 ```
 
 ```bash

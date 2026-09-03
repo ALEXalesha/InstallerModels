@@ -559,6 +559,63 @@ def pending(manifest, keys, root):
     return queue
 
 
+# Что пойдёт под снос. shared - другие группы, которым этот файл тоже нужен.
+Doomed = namedtuple("Doomed", "dest path size shared")
+
+
+def removable(manifest, keys, root):
+    """Что удалится, если убрать названные группы.
+
+    Считает только то, что действительно лежит на диске, и по путям из
+    манифеста - никаких обходов папок и никакого рекурсивного удаления в коде
+    нет вовсе. Барьер тут тот же, что и на записи: dest_path() отвергает "..",
+    букву диска и имена устройств, так что стереть мимо папки ComfyUI нечем.
+
+    Заодно отмечает файлы, которые нужны и другим группам: один и тот же dest
+    манифест разрешает записать дважды, и снос группы А оставил бы группу Б
+    навсегда неполной.
+    """
+    keys = unique(keys)
+    чужое = {}
+    for имя, группа in manifest["groups"].items():
+        if имя in keys:
+            continue
+        for entry in группа["files"]:
+            чужое.setdefault(entry["dest"], []).append(имя)
+
+    план, видели = [], set()
+    for key in keys:
+        for entry in manifest["groups"][key]["files"]:
+            if entry["dest"] in видели:
+                continue
+            видели.add(entry["dest"])
+            цель = dest_path(root, entry["dest"])
+            # Недокачанный кусок - тоже занятое место, и убирать его надо вместе
+            # с файлом: иначе "удалил, а место не освободилось".
+            for path in (цель, part_path(цель)):
+                if path.is_file():
+                    план.append(Doomed(entry["dest"], path, path.stat().st_size,
+                                       чужое.get(entry["dest"], [])))
+    return план
+
+
+def remove_files(plan):
+    """Стирает по готовому списку. Возвращает, что ушло и что не поддалось.
+
+    Не поддаться может запросто: Windows не даёт удалить файл, который держит
+    открытым запущенный ComfyUI. Это не повод бросать остальные - убираем что
+    можем и честно перечисляем, что осталось.
+    """
+    ушло, осталось = [], []
+    for item in plan:
+        try:
+            item.path.unlink()
+            ушло.append(item)
+        except OSError as err:
+            осталось.append((item, str(err)))
+    return ушло, осталось
+
+
 def needed_bytes(queue, root):
     """Сколько ещё предстоит скачать. Недокачанные .part уже лежат на диске и
     места заново не просят: без этого прерванная на середине группа на 40 ГБ

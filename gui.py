@@ -27,6 +27,8 @@ from core import (
     part_path,
     pending,
     remember_root,
+    removable,
+    remove_files,
     status,
 )
 
@@ -197,6 +199,11 @@ class App(ttk.Frame):
         self.cancel_button = ttk.Button(actions, text="Отмена", command=self.cancel, state="disabled")
         self.cancel_button.pack(side="left", padx=6)
         ttk.Button(actions, text="Проверить файлы", command=self.refresh).pack(side="left")
+        # Единственная необратимая кнопка окна, поэтому и стоит поодаль от
+        # остальных, и спрашивает подтверждение с названным объёмом.
+        self.remove_button = ttk.Button(actions, text="Удалить выбранное",
+                                        command=self.remove)
+        self.remove_button.pack(side="right")
 
         log_box = ttk.LabelFrame(page, text=" Лог ", padding=4)
         log_box.grid(row=5, column=0, sticky="nsew")
@@ -259,7 +266,7 @@ class App(ttk.Frame):
         state = "disabled" if running else "normal"
         self.root_entry.configure(state=state)
         self.browse_button.configure(state=state)
-        for button in self.pick_buttons:
+        for button in self.pick_buttons + [self.remove_button]:
             button.configure(state=state)
         for row in self.rows.values():
             row.box.configure(state=state)
@@ -400,6 +407,58 @@ class App(ttk.Frame):
 
         self.worker = threading.Thread(target=self.run_job, args=(job, root), daemon=True)
         self.worker.start()
+
+    def remove(self):
+        """Удаляет модели выбранных групп. Необратимо, поэтому осторожно.
+
+        Стираются ровно те пути, что записаны в манифесте: папки не трогаются,
+        рекурсивного удаления тут нет вовсе. Файл, нужный ещё и другой группе,
+        пропускается - иначе снос одной группы оставил бы вторую навсегда
+        неполной, и человек искал бы причину в скачивании.
+        """
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Идёт скачивание", "Дождись конца или нажми «Отмена».")
+            return
+        root = self.current_root()
+        if not root.is_dir():
+            messagebox.showerror("Папка не найдена", f"Нет такой папки:\n{root}")
+            return
+
+        план = removable(self.manifest, self.chosen_keys(), root)
+        свои = [d for d in план if not d.shared]
+        общих = len(план) - len(свои)
+        if not свои:
+            messagebox.showinfo(
+                "Нечего удалять",
+                "Выбранных файлов на диске нет."
+                + ("\n\nОстальные нужны другим группам." if общих else ""),
+            )
+            return
+
+        место = sum(d.size for d in свои)
+        хвост = f"\n\nПропущено как общих с другими группами: {общих}" if общих else ""
+        if not messagebox.askyesno(
+            "Удалить модели?",
+            f"Будет удалено файлов: {len(свои)}\nОсвободится: {size_ru(место)}"
+            f"\n\nПапка: {root}{хвост}"
+            f"\n\nЭто необратимо. Скачивать их потом заново - "
+            f"{size_ru(место)} трафика.",
+        ):
+            return
+
+        ушло, осталось = remove_files(свои)
+        self.log(f"удалено файлов: {len(ушло)}, освобождено "
+                 f"{size_ru(sum(d.size for d in ушло))}")
+        for doomed, почему in осталось:
+            self.log(f"НЕ УДАЛОСЬ {doomed.dest}: {почему}")
+        self.refresh()
+        if осталось:
+            messagebox.showwarning(
+                "Часть файлов осталась",
+                "Не удалось удалить:\n\n"
+                + "\n".join(d.dest for d, _ in осталось)
+                + "\n\nОбычно их держит запущенный ComfyUI. Закрой его и повтори.",
+            )
 
     def cancel(self):
         self.stop_flag.set()

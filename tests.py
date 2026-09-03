@@ -1423,6 +1423,166 @@ def hashing_a_file_on_disk_reports_progress():
         raise AssertionError("отмена обязана была всплыть")
 
 
+УДАЛЕНИЕ = {
+    "comfyui_root": "C:/ComfyUI",
+    "groups": {
+        "первая": {"title": "A", "files": [
+            {"dest": "models/vae/один.bin", "repo": "r", "path": "p", "size": 100},
+            {"dest": "models/loras/два.bin", "repo": "r", "path": "p", "size": 200},
+            {"dest": "models/vae/общий.bin", "repo": "r", "path": "p", "size": 300},
+        ]},
+        "вторая": {"title": "B", "files": [
+            {"dest": "models/vae/общий.bin", "repo": "r", "path": "p", "size": 300},
+            {"dest": "models/vae/чужой.bin", "repo": "r", "path": "p", "size": 400},
+        ]},
+    },
+}
+
+
+def разложить_для_удаления(root):
+    """Кладёт на диск то, что описано в УДАЛЕНИЕ, плюс недокачанный кусок."""
+    shutil.rmtree(root, ignore_errors=True)
+    for имя, размер in (("models/vae/один.bin", 100), ("models/loras/два.bin", 200),
+                        ("models/vae/общий.bin", 300), ("models/vae/чужой.bin", 400)):
+        путь = root / имя
+        путь.parent.mkdir(parents=True, exist_ok=True)
+        путь.write_bytes(bytes(размер))
+    core.part_path(root / "models/vae/один.bin").write_bytes(bytes(50))
+    # Постороннее, которого в манифесте нет: его не должно тронуть ничем.
+    (root / "models" / "чужое.txt").write_text("не моё", encoding="utf-8")
+    (root / "models" / "vae" / "тоже-чужое.bin").write_bytes(bytes(10))
+    return root
+
+
+@case
+def removal_touches_only_what_the_manifest_names():
+    """Удаление необратимо, и границы у него должны быть жёсткие.
+
+    Стираются ровно те пути, что записаны в манифесте. Папки не трогаются,
+    рекурсивного удаления в коде нет вовсе, а посторонние файлы в тех же папках
+    остаются на месте. Барьер тот же, что и на записи: dest_path() отвергает
+    "..", букву диска и имена устройств.
+    """
+    root = разложить_для_удаления(TMP / "снос")
+
+    план = core.removable(УДАЛЕНИЕ, ["первая"], root)
+    по_именам = sorted(d.path.name for d in план)
+    assert по_именам == ["два.bin", "общий.bin", "один.bin", "один.bin.part"], по_именам
+
+    # Недокачанный кусок идёт вместе с файлом: иначе «удалил, а место не
+    # освободилось» - на 30 ГиБ такой хвост заметен.
+    assert any(d.path.name.endswith(".part") for d in план), ".part не попал под снос"
+    assert sum(d.size for d in план) == 100 + 50 + 200 + 300
+
+    # Ни один путь не имеет права оказаться вне папки ComfyUI.
+    for doomed in план:
+        assert root in doomed.path.parents, f"путь вне корня: {doomed.path}"
+
+    # Файл, нужный и второй группе, помечен как общий.
+    общий = next(d for d in план if d.path.name == "общий.bin")
+    assert общий.shared == ["вторая"], общий.shared
+    assert all(not d.shared for d in план if d.path.name != "общий.bin")
+
+    # Сносим только не-общие и смотрим, что уцелело.
+    свои = [d for d in план if not d.shared]
+    ушло, осталось = core.remove_files(свои)
+    assert len(ушло) == 3 and not осталось, (ушло, осталось)
+
+    assert not (root / "models/vae/один.bin").exists()
+    assert not core.part_path(root / "models/vae/один.bin").exists()
+    assert not (root / "models/loras/два.bin").exists()
+    assert (root / "models/vae/общий.bin").exists(), "общий файл снесли"
+    assert (root / "models/vae/чужой.bin").exists(), "тронули чужую группу"
+    # Посторонние файлы и сами папки - на месте.
+    assert (root / "models" / "чужое.txt").exists(), "снесли посторонний файл"
+    assert (root / "models" / "vae" / "тоже-чужое.bin").exists()
+    assert (root / "models" / "vae").is_dir(), "папку трогать нельзя"
+    assert (root / "models" / "loras").is_dir()
+
+
+@case
+def removal_survives_a_file_someone_holds_open():
+    """ComfyUI держит .safetensors открытым, и Windows не даёт его удалить.
+
+    Это не повод бросать остальные: убираем что можем и честно перечисляем,
+    что осталось, - иначе человек решит, что место освободилось, а оно нет.
+    """
+    root = разложить_для_удаления(TMP / "снос-занято")
+    план = [d for d in core.removable(УДАЛЕНИЕ, ["первая"], root) if not d.shared]
+
+    держим = open(root / "models/loras/два.bin", "rb")
+    try:
+        ушло, осталось = core.remove_files(план)
+    finally:
+        держим.close()
+
+    assert len(ушло) == 2, [d.path.name for d in ушло]
+    assert len(осталось) == 1, осталось
+    doomed, почему = осталось[0]
+    assert doomed.path.name == "два.bin"
+    assert почему, "не сказано, почему не вышло"
+    assert (root / "models/loras/два.bin").exists(), "занятый файл всё-таки снесли"
+
+
+@case
+def the_remove_command_asks_before_it_deletes():
+    """Единственная необратимая команда программы. Без --yes она обязана только
+    показывать список: нажать её случайно - это 95 ГиБ и часы обратно."""
+    import contextlib
+    import io
+
+    import install
+
+    root = разложить_для_удаления(TMP / "снос-консоль")
+
+    def прогнать(keys, yes):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = install.cmd_remove(УДАЛЕНИЕ, root, keys, yes)
+        return code, out.getvalue()
+
+    # Без --yes: показать и ничего не тронуть.
+    code, text = прогнать(["первая"], False)
+    assert code == 1, text
+    assert "ничего не удалено" in text and "--yes" in text, text
+    assert "освободится" in text, text
+    assert (root / "models/vae/один.bin").exists(), "удалил без подтверждения"
+
+    # Общий файл виден в отчёте как пропущенный, с названием группы.
+    assert "пропуск" in text and "вторая" in text, text
+
+    # С --yes: удалить и доложить.
+    code, text = прогнать(["первая"], True)
+    assert code == 0, text
+    assert "удалено файлов: 3" in text, text
+    assert not (root / "models/vae/один.bin").exists()
+    assert (root / "models/vae/общий.bin").exists(), "снесли общий файл"
+    assert (root / "models/vae/чужой.bin").exists(), "тронули чужую группу"
+
+    # Второй заход по той же группе: своё уже снесено, остался только общий
+    # файл. Это не ошибка, и сказать об этом надо именно так, а не "нечего
+    # удалять" - иначе непонятно, почему место не освободилось целиком.
+    code, text = прогнать(["первая"], True)
+    assert code == 0, text
+    assert "нужно другим группам" in text, text
+    assert (root / "models/vae/общий.bin").exists()
+
+    # Назвали обе группы - общий файл больше никому не нужен и законно уходит.
+    # Иначе он остался бы лежать навсегда, и снести его было бы нечем.
+    code, text = прогнать(["первая", "вторая"], True)
+    assert code == 0, text
+    assert "общий.bin" in text, "общий файл обязан уйти, когда сносят обе группы"
+    assert not (root / "models/vae/общий.bin").exists()
+    assert not (root / "models/vae/чужой.bin").exists()
+
+    # А когда из манифеста на диске не осталось ничего - вот тогда «нечего».
+    code, text = прогнать(["первая", "вторая"], True)
+    assert code == 0 and "нечего удалять" in text, text
+    # И посторонние файлы пережили всё это целиком.
+    assert (root / "models" / "чужое.txt").exists()
+    assert (root / "models" / "vae" / "тоже-чужое.bin").exists()
+
+
 @case
 def the_progress_line_never_breaks():
     """Полоска в консоли рисуется поверх самой себя, и её ширина - часть
@@ -1765,6 +1925,112 @@ def the_window_download_loop_handles_every_ending():
     события = dict(окно.выгрести())
     assert "done" in события, "done не ушло, окно осталось бы запертым навсегда"
     assert события["done"][0], "внутренняя ошибка обязана попасть в список неудач"
+
+
+@case
+def the_delete_button_never_fires_without_a_yes():
+    """Самая опасная кнопка окна: одно нажатие - и 95 ГиБ надо качать заново.
+
+    Проверяем не то, что она удаляет, а то, когда она удалять отказывается:
+    без подтверждения, во время закачки, в несуществующей папке. И что в
+    вопросе назван объём - «удалить?» без цифры человек прожмёт не глядя.
+    """
+    import tkinter as tk
+
+    import gui
+
+    спросили = []
+
+    class Диалоги:
+        ответ = False
+
+        @staticmethod
+        def showinfo(title, text=""):
+            спросили.append(("инфо", title, text))
+
+        @staticmethod
+        def showerror(title, text=""):
+            спросили.append(("ошибка", title, text))
+
+        @staticmethod
+        def showwarning(title, text=""):
+            спросили.append(("предупреждение", title, text))
+
+        @staticmethod
+        def askyesno(title, text=""):
+            спросили.append(("вопрос", title, text))
+            return Диалоги.ответ
+
+    root = разложить_для_удаления(TMP / "снос-окно")
+    было_окно, было_root = gui.messagebox, os.environ.get("COMFYUI_ROOT")
+    os.environ["COMFYUI_ROOT"] = str(root)
+    gui.messagebox = Диалоги
+    window = None
+    try:
+        try:
+            window = tk.Tk()
+        except tk.TclError as err:
+            raise AssertionError(f"Tk не поднялся: {err}") from None
+        window.withdraw()
+        app = gui.App(window)
+        app.manifest = УДАЛЕНИЕ          # свой манифест, чтобы не сносить настоящее
+        app.rows = {}                    # строки от настоящего манифеста тут ни к чему
+        app.chosen_keys = lambda: ["первая"]
+
+        # Сказали «нет» - не должно пропасть ничего.
+        Диалоги.ответ = False
+        app.remove()
+        вид, заголовок, текст = спросили[-1]
+        assert вид == "вопрос", спросили
+        assert "необратимо" in текст, "в вопросе не сказано, что это навсегда"
+        # 100 за один.bin, 50 за его недокачанный кусок, 200 за два.bin.
+        # Общий файл в объём не входит: он пропускается, и обещать его место
+        # было бы враньём.
+        assert "350 Б" in текст, f"в вопросе не назван объём: {текст!r}"
+        assert "Пропущено как общих" in текст, текст
+        assert (root / "models/vae/один.bin").exists(), "удалил после «нет»"
+
+        # Идёт закачка - удалять нельзя вообще, даже не спрашивая.
+        спросили.clear()
+        Диалоги.ответ = True
+
+        class Живой:
+            @staticmethod
+            def is_alive():
+                return True
+
+        app.worker = Живой
+        app.remove()
+        assert [в for в, _, _ in спросили] == ["инфо"], спросили
+        assert (root / "models/vae/один.bin").exists(), "удалил во время закачки"
+        app.worker = None
+
+        # Папки нет - тоже отказ.
+        спросили.clear()
+        app.root_path.set(str(TMP / "нет-такой-папки"))
+        app.remove()
+        assert [в for в, _, _ in спросили] == ["ошибка"], спросили
+        app.root_path.set(str(root))
+
+        # И только теперь, по явному «да», удаляет - и не трогает лишнего.
+        спросили.clear()
+        app.remove()
+        assert not (root / "models/vae/один.bin").exists(), "не удалил по «да»"
+        assert (root / "models/vae/общий.bin").exists(), "снёс общий файл"
+        assert (root / "models" / "чужое.txt").exists(), "снёс посторонний файл"
+
+        app.root_path = None
+        app.closing = True
+    finally:
+        gui.messagebox = было_окно
+        if было_root is None:
+            os.environ.pop("COMFYUI_ROOT", None)
+        else:
+            os.environ["COMFYUI_ROOT"] = было_root
+        if window is not None:
+            gc.collect()
+            window.destroy()
+            gc.collect()
 
 
 @case

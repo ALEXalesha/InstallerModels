@@ -23,6 +23,8 @@ from core import (
     manifest_path,
     needed_bytes,
     pending,
+    removable,
+    remove_files,
     save_manifest,
     status,
     unique,
@@ -255,6 +257,54 @@ def cmd_verify(manifest, root, keys=None):
     return 1 if (bad or incomplete) else 0
 
 
+def cmd_remove(manifest, root, keys, yes):
+    """Удаляет модели названных групп.
+
+    Раньше программа этого не делала намеренно: удалять 95 ГиБ должен человек
+    руками. Но освобождать место всё равно приходится, а руками это пятнадцать
+    путей по разным папкам, и промахнуться там проще, чем кажется.
+
+    Поэтому: без --yes ничего не стирается, показывается только список. Под
+    снос идут ровно те пути, что записаны в манифесте, папки не трогаются
+    вовсе, а файл, нужный и другой группе, пропускается.
+    """
+    план = removable(manifest, keys, root)
+    if not план:
+        print("нечего удалять - этих файлов на диске нет")
+        return 0
+
+    общий = [d for d in план if d.shared]
+    свои = [d for d in план if not d.shared]
+
+    for doomed in свои:
+        print(f"  {human(doomed.size):>10}  {doomed.path.name}")
+    for doomed in общий:
+        print(f"  {'пропуск':>10}  {doomed.path.name}")
+        print(f"  {'':>10}  нужен ещё группам: {', '.join(doomed.shared)}")
+
+    место = sum(d.size for d in свои)
+    print(f"\nфайлов под удаление: {len(свои)}, освободится {human(место)}")
+    if общий:
+        print(f"пропущено как общих с другими группами: {len(общий)}")
+    if not свои:
+        print("удалять нечего: всё перечисленное нужно другим группам")
+        return 0
+
+    if not yes:
+        print("это только список, ничего не удалено")
+        print("повтори с --yes, чтобы удалить на самом деле")
+        return 1
+
+    ушло, осталось = remove_files(свои)
+    print(f"\nудалено файлов: {len(ушло)}, освобождено {human(sum(d.size for d in ушло))}")
+    for doomed, почему in осталось:
+        print(f"  НЕ УДАЛОСЬ {doomed.path.name}: {почему}")
+    if осталось:
+        print("закрой ComfyUI, если он держит эти файлы открытыми, и повтори")
+        return 1
+    return 0
+
+
 def cmd_install(manifest, root, keys, dry_run):
     queue = pending(manifest, keys, root)
     wanted = {e["dest"] for e in queue}
@@ -349,6 +399,10 @@ def main():
     parser.add_argument("--check", action="store_true", help="verify what is on disk")
     parser.add_argument("--verify", action="store_true",
                         help="recompute sha256 of downloaded files (slow, reads them all)")
+    parser.add_argument("--remove", action="store_true",
+                        help="delete downloaded models of the named groups")
+    parser.add_argument("--yes", action="store_true",
+                        help="with --remove: actually delete, not just list")
     parser.add_argument("--lmstudio", action="store_true", help="show LM Studio model names")
     parser.add_argument("--sync-manifest", action="store_true",
                         help="check sizes in models.json against Hugging Face")
@@ -374,7 +428,8 @@ def main():
 
     root = comfy_root(manifest, args.root)
 
-    if args.list or not (args.groups or args.all or args.check or args.verify):
+    if args.list or not (args.groups or args.all or args.check or args.verify
+                         or args.remove):
         cmd_list(manifest, root)
         if not args.list:
             print("\nusage:  python install.py ltx qwen   |   python install.py --all")
@@ -399,6 +454,14 @@ def main():
 
     if args.verify:
         return cmd_verify(manifest, root, keys)
+
+    if args.remove:
+        # Удалять всё скопом по случайной команде нельзя: назови группы или
+        # скажи --all явно. Это единственная необратимая команда программы.
+        if not keys:
+            print("--remove требует названий групп или --all")
+            return 1
+        return cmd_remove(manifest, root, keys, args.yes)
 
     return cmd_install(manifest, root, keys, args.dry_run)
 

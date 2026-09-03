@@ -975,6 +975,78 @@ def the_download_asks_for_no_compression():
 
 
 @case
+def a_missing_folder_makes_the_program_look_for_comfyui():
+    """Перенос на другую машину: путь из models.json указывает в профиль того,
+    кто этот файл правил, и у второго человека такой папки просто нет. Раньше
+    окно на этом показывало «папка не найдена» и ждало, пока ткнут «Обзор».
+
+    Приметы сняты с настоящей установки, а не выдуманы. Сперва искались main.py
+    и папка comfy - и это не сработало бы даже на той машине, где писалось: у
+    ComfyUI Desktop их нет, там custom_nodes, input, models, output, temp, user.
+    """
+    гнездо = TMP / "поиск"
+    гнездо.mkdir(exist_ok=True)
+
+    настоящий = гнездо / "ComfyUI"
+    (настоящий / "models" / "checkpoints").mkdir(parents=True, exist_ok=True)
+    (настоящий / "custom_nodes").mkdir(exist_ok=True)      # раскладка Desktop
+    assert core.looks_like_comfy(настоящий)
+
+    классический = гнездо / "Классический"
+    (классический / "models").mkdir(parents=True, exist_ok=True)
+    (классический / "main.py").write_text("", encoding="utf-8")
+    assert core.looks_like_comfy(классический), "классическая установка не опознана"
+
+    # А вот что папкой ComfyUI считаться не должно.
+    пустая = гнездо / "Пустая"
+    пустая.mkdir(exist_ok=True)
+    голые_модели = гнездо / "ГолыеМодели"
+    (голые_модели / "models").mkdir(parents=True, exist_ok=True)
+    файл = гнездо / "ЭтоФайл"
+    файл.write_text("", encoding="utf-8")
+    for мимо in (пустая, голые_модели, файл, гнездо / "Нет такой"):
+        assert not core.looks_like_comfy(мимо), f"опознал как ComfyUI: {мимо.name}"
+
+    assert core.find_comfy([пустая, голые_модели, настоящий]) == настоящий
+    assert core.find_comfy([пустая, голые_модели]) is None
+
+    # Записанный путь никуда не ведёт - ищем. Ведёт - не трогаем ничего.
+    #
+    # Поиск подменяем: настоящий обходит обычные места, и на машине, где ComfyUI
+    # стоит, нашёл бы его. Проверка от этого зависеть не должна - она про то,
+    # подключён ли поиск и когда именно, а не про то, что лежит у меня на диске.
+    нет_такой = гнездо / "нет-такой-папки"
+    было_env = os.environ.pop("COMFYUI_ROOT", None)
+    было_find = core.find_comfy
+    try:
+        core.find_comfy = lambda candidates=None: настоящий
+        assert core.comfy_root({"comfyui_root": str(нет_такой)}) == настоящий, \
+            "путь никуда не ведёт, а поиск не включился"
+        assert core.comfy_root({"comfyui_root": str(классический)}) == классический, \
+            "работающий путь перебивать поиском нельзя"
+
+        # Ничего не нашлось - показываем записанный путь, как и раньше, чтобы
+        # человек увидел в окне именно то, что чинить.
+        core.find_comfy = lambda candidates=None: None
+        assert core.comfy_root({"comfyui_root": str(нет_такой)}) == нет_такой
+
+        # Названное прямо не подменяется никогда, даже когда поиск что-то нашёл.
+        # Иначе опечатка в --root молча увела бы закачку на 95 ГиБ в чужую папку,
+        # а человек узнал бы об этом по кончившемуся месту на диске.
+        core.find_comfy = lambda candidates=None: настоящий
+        assert core.comfy_root({"comfyui_root": "x"}, str(нет_такой)) == нет_такой, \
+            "--root подменили автопоиском"
+        os.environ["COMFYUI_ROOT"] = str(нет_такой)
+        assert core.comfy_root({"comfyui_root": "x"}) == нет_такой, \
+            "COMFYUI_ROOT подменили автопоиском"
+        os.environ.pop("COMFYUI_ROOT", None)
+    finally:
+        core.find_comfy = было_find
+        if было_env is not None:
+            os.environ["COMFYUI_ROOT"] = было_env
+
+
+@case
 def a_broken_manifest_never_shows_a_python_traceback():
     """Любая кривизна в models.json обязана всплывать одним ValueError.
 
@@ -1029,6 +1101,10 @@ def the_browsed_folder_wins_over_the_manifest():
     manifest = {"comfyui_root": "C:/FromManifest"}
     was = os.environ.get("LOCALAPPDATA")
     os.environ["LOCALAPPDATA"] = str(TMP / "appdata")
+    # Проверка про порядок источников, а не про автопоиск: путей тут нарочно
+    # несуществующих, и на машине, где ComfyUI стоит, поиск подставлял бы его.
+    было_find = core.find_comfy
+    core.find_comfy = lambda candidates=None: None
     try:
         assert core.comfy_root(manifest) == Path("C:/FromManifest")
         core.remember_root("C:/FromBrowse")
@@ -1041,6 +1117,7 @@ def the_browsed_folder_wins_over_the_manifest():
         core.settings_path().write_text("[1, 2]", encoding="utf-8")
         assert core.saved_root() is None
     finally:
+        core.find_comfy = было_find
         os.environ.pop("COMFYUI_ROOT", None)
         if was is None:
             os.environ.pop("LOCALAPPDATA", None)

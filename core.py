@@ -263,16 +263,68 @@ def remember_root(path):
         pass  # не запомнили - не беда, работать это не мешает
 
 
+# Приметы папки ComfyUI, снятые с настоящей установки, а не выдуманные.
+#
+# Сперва я собирался искать main.py или папку comfy - и это не сработало бы даже
+# на той машине, где писалось: у ComfyUI Desktop их нет вовсе, там лежат
+# custom_nodes, input, models, output, temp, user. У классической установки и у
+# portable-сборки есть main.py и comfy. Поэтому обязательна только models, а
+# рядом достаточно любого спутника из списка.
+COMFY_MARKS = ("custom_nodes", "input", "output", "user", "main.py", "comfy")
+
+
+def looks_like_comfy(path):
+    """Папка с именем ComfyUI - ещё не ComfyUI."""
+    path = Path(path)
+    try:
+        if not (path / "models").is_dir():
+            return False
+        return any((path / mark).exists() for mark in COMFY_MARKS)
+    except OSError:
+        return False  # отключённый сетевой диск, нет прав - просто мимо
+
+
+def comfy_candidates():
+    """Обычные места, и только они. Обходить диски целиком нельзя: у человека
+    с 95 ГиБ моделей это минуты работы винта на ровном месте, а угадывать надо
+    лишь тогда, когда записанный путь всё равно не подошёл."""
+    home = Path.home()
+    места = [home / "Documents", home]
+    места += [Path(f"{буква}:/") for буква in "CDEFGH"]
+    for место in места:
+        yield место / "ComfyUI"
+        yield место / "ComfyUI_windows_portable" / "ComfyUI"
+
+
+def find_comfy(candidates=None):
+    for path in (candidates if candidates is not None else comfy_candidates()):
+        if looks_like_comfy(path):
+            return Path(path)
+    return None
+
+
 def comfy_root(manifest, override=None):
     """Порядок: --root, переменная окружения, папка из «Обзора», models.json.
 
     Папку из «Обзора» до сих пор знало только окно, а install.py каждый раз начинал
     с пути в models.json: выберешь папку мышкой - в консоли она всё равно не та,
     и одна и та же команда у окна и у консоли считала разные файлы установленными.
+
+    Если выбранный путь никуда не ведёт, ищем ComfyUI в обычных местах. Это про
+    перенос на другую машину: comfyui_root в models.json указывает в профиль
+    того, кто этот файл правил, и у второго человека такой папки просто нет.
+    Ничего работающего это не перебивает - поиск включается только тогда, когда
+    записанный путь и так оказался пустым местом.
     """
-    root = (override or os.environ.get("COMFYUI_ROOT") or saved_root()
-            or manifest["comfyui_root"])
-    return Path(root).expanduser()
+    прямо = override or os.environ.get("COMFYUI_ROOT")
+    root = Path(прямо or saved_root() or manifest["comfyui_root"]).expanduser()
+    # Названное прямо - --root или COMFYUI_ROOT - не подменяем никогда, даже
+    # если такой папки нет. Человек указал место; молча увести закачку на 95 ГиБ
+    # в другое куда хуже, чем сказать «папка не найдена». Ищем только там, где
+    # путь взялся сам: из запомненного или из models.json.
+    if прямо or root.is_dir():
+        return root
+    return find_comfy() or root
 
 
 HF_HOST = "https://huggingface.co"

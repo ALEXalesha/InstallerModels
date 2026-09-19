@@ -31,7 +31,7 @@ TIMEOUT = 60
 # заводить. NSIS читать Python не умеет, поэтому build.py кладёт ему эти же
 # три строки в version.nsh перед сборкой.
 APP = "InstallerModels"
-VERSION = "1.0.6"
+VERSION = "2.0.0"
 # Установщик ищет запущенную программу по заголовку окна через FindWindow.
 WINDOW_TITLE = f"{APP} - модели для ComfyUI"
 FROZEN = getattr(sys, "frozen", False)

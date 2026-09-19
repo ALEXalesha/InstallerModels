@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Собирает portable exe и установщик. Запускать из папки проекта: python build.py"""
+"""Собирает папку программы, portable-архив и установщик.
+
+Запускать через build.ps1: он создаёт .venv проекта и зовёт этот скрипт оттуда.
+"""
 
 import json
 import re
@@ -40,7 +43,18 @@ SHARED = [
     "--exclude-module", "numpy",
     "--exclude-module", "pygame",
     "--exclude-module", "pytest",
+    # С версии 2.0 окно на Qt: Tk больше не нужен, а из Qt нужны только
+    # Core, Gui и Widgets. Остальное PyInstaller тащит «на всякий случай».
+    "--exclude-module", "tkinter",
+    "--exclude-module", "_tkinter",
+    *[arg for name in ("QtNetwork", "QtQml", "QtQuick", "QtSql", "QtOpenGL", "QtPdf",
+                       "QtSvg", "QtDBus")
+      for arg in ("--exclude-module", f"PySide6.{name}")],
 ]
+
+# После PyInstaller из Qt выкидываем то, что окну не нужно никогда: программный
+# OpenGL (20 МБ, Qt Widgets его не зовут) и переводы на все языки, кроме русского.
+QT_JUNK = ["opengl32sw.dll"]
 
 
 def run(args, label):
@@ -128,11 +142,42 @@ def check_tests():
 
 def check_pyinstaller():
     """Спрашиваем до очистки dist/ и build/. Не найдётся после - и от прошлой
-    сборки ничего не осталось бы, а новая не появилась."""
+    сборки ничего не осталось бы, а новая не появилась.
+
+    PySide6 и PyInstaller живут в .venv проекта, а не в общем Python: там они
+    конфликтовали бы с чужими версиями. build.ps1 создаёт .venv и ставит всё сам.
+    """
     probe = subprocess.run([sys.executable, "-m", "PyInstaller", "--version"],
                            capture_output=True)
     if probe.returncode:
-        sys.exit("PyInstaller не найден: python -m pip install pyinstaller")
+        sys.exit("PyInstaller не найден. Собирай через build.ps1 - он поставит всё в .venv")
+    probe = subprocess.run([sys.executable, "-c", "import PySide6"], capture_output=True)
+    if probe.returncode:
+        sys.exit("PySide6 не найден. Собирай через build.ps1 - он поставит всё в .venv")
+
+
+def trim_qt(app_folder):
+    """Убирает из собранной папки куски Qt, которые окну не нужны."""
+    qt = app_folder / "_internal" / "PySide6"
+    for name in QT_JUNK:
+        (qt / name).unlink(missing_ok=True)
+    translations = qt / "translations"
+    if translations.is_dir():
+        for f in translations.iterdir():
+            if f.is_file() and not f.name.startswith("qtbase_ru"):
+                f.unlink()
+
+
+def zip_portable(app_folder, target):
+    """Portable - та же папка программы, что и в установщике, только в zip.
+
+    До 2.0 portable был одним exe (--onefile). С Qt такой exe при каждом старте
+    распаковывал бы себя во временную папку - десятки мегабайт, секунды ожидания.
+    Папку распаковывают один раз.
+    """
+    target.unlink(missing_ok=True)
+    return Path(shutil.make_archive(str(target.with_suffix("")), "zip",
+                                    root_dir=app_folder.parent, base_dir=app_folder.name))
 
 
 def check_manifest():
@@ -218,18 +263,17 @@ def main():
         if old.exists():
             sys.exit(f"не могу очистить {old} - что-то держит файлы, закрой это и повтори")
 
-    portable = DIST / "portable"
-    pyinstaller("--onefile", portable, WORK / "onefile")
-    lay_out_extras(portable)
-
     payload = DIST / "app"
     pyinstaller("--onedir", payload, WORK / "onedir")
+    trim_qt(payload / APP)
     lay_out_extras(payload / APP)
 
     # setup.nsi берёт файлы по жёстко записанному пути. Разъедется он с тем, что
     # выложил PyInstaller, - makensis соберёт установщик из воздуха и не пожалуется.
     if not (payload / APP / f"{APP}.exe").exists():
         sys.exit(f"PyInstaller не положил {APP}.exe в {payload / APP}, установщик собирать не из чего")
+
+    portable = zip_portable(payload / APP, DIST / f"{APP}-portable-{VERSION}.zip")
 
     nsis = find_nsis()
     if nsis:
@@ -240,8 +284,7 @@ def main():
         print("\nNSIS не найден, установщик не собран. Portable готов.")
 
     print("\n=== готово ===")
-    exe = portable / f"{APP}.exe"
-    print(f"portable   {exe}  ({exe.stat().st_size / 1024**2:.1f} МБ)")
+    print(f"portable   {portable}  ({portable.stat().st_size / 1024**2:.1f} МБ)")
     print(f"папка app  {payload / APP}  ({folder_size(payload / APP) / 1024**2:.1f} МБ)")
     setup = DIST / f"{APP}-Setup-{VERSION}.exe"
     if setup.exists():

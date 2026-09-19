@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Проверки на всё, что уже ломалось. Запуск: python tests.py
 
-Зависимостей нет нарочно: build.py гоняет их перед сборкой, а сборка идёт на
-голом Python. Сеть тоже не нужна - Hugging Face изображает локальный сервер,
-которому можно велеть рвать соединение когда захочется.
+Запускать из .venv проекта: .venv\Scripts\python.exe tests.py. Из сторонних
+библиотек нужен только PySide6 - для проверок окна; build.ps1 ставит его в .venv
+сам. Сеть не нужна - Hugging Face изображает локальный сервер, которому можно
+велеть рвать соединение когда захочется.
 """
 
 import gc
@@ -836,8 +837,9 @@ def one_source_for_the_name_version_and_title():
     assert f'!define VERSION "{core.VERSION}"' in body, body
     assert f'!define WINTITLE "{core.WINDOW_TITLE}"' in body, body
 
-    # Окно ставит себе тот же заголовок, который уезжает в установщик.
-    assert "window.title(WINDOW_TITLE)" in (HERE / "gui.py").read_text(encoding="utf-8"), \
+    # Окно ставит себе тот же заголовок, который уезжает в установщик. Живое
+    # окно по нему ищет FindWindow в the_window_builds_and_survives_every_event.
+    assert "self.setWindowTitle(WINDOW_TITLE)" in (HERE / "gui.py").read_text(encoding="utf-8"), \
         "окно берёт заголовок не из core.WINDOW_TITLE"
 
 
@@ -1694,73 +1696,176 @@ def the_build_refuses_a_broken_project():
         shutil.rmtree(good, ignore_errors=True)
 
 
-@case
-def the_window_builds_and_survives_every_event():
-    """Окно не проверялось ни одной строкой: 332 строки, ноль.
+# ------------------------------------------------------------------ окно (Qt)
 
-    Арифметика полосок уехала в core.QueueProgress и перебирается отдельно, а
-    тут остаётся обвязка: сборка виджетов, насос событий, три исхода закачки и
-    замок на кнопках. Ломается она молча - окно просто не открывается или
-    остаётся с заблокированной кнопкой, и узнать об этом можно было только
-    запустив exe руками после сборки.
+class Диалоги:
+    """Подмена gui.dialogs на время проверки: настоящий QMessageBox остановил
+    бы прогон намертво. Запоминает, что и как спросили."""
 
-    Диалоги подменяем: настоящий messagebox остановил бы прогон намертво.
+    def __init__(self, ответ=False, папка=""):
+        self.ответ = ответ
+        self.папка = папка
+        self.показано = []
+
+    def __enter__(self):
+        import gui
+
+        self.было = {name: gui.dialogs.__dict__[name]
+                     for name in ("info", "error", "warning", "yes_no", "pick_dir")}
+        запись = self.показано
+
+        def сказать(вид):
+            return staticmethod(lambda _parent, title, text="": запись.append((вид, title, text)))
+
+        gui.dialogs.info = сказать("инфо")
+        gui.dialogs.error = сказать("ошибка")
+        gui.dialogs.warning = сказать("предупреждение")
+
+        def спросить(_parent, title, text="", default_no=False):
+            запись.append(("вопрос", title, text))
+            self.по_умолчанию_нет = default_no
+            return self.ответ
+
+        def папку(_parent, _title, _start):
+            запись.append(("папка", _title, _start))
+            return self.папка
+
+        gui.dialogs.yes_no = staticmethod(спросить)
+        gui.dialogs.pick_dir = staticmethod(папку)
+        return self
+
+    def __exit__(self, *_):
+        import gui
+
+        for name, value in self.было.items():
+            setattr(gui.dialogs, name, value)
+
+    def виды(self):
+        return [вид for вид, _, _ in self.показано]
+
+
+def qt_окно(root):
+    """Настоящее окно Qt, но не на экране: WA_DontShowOnScreen.
+
+    Платформу offscreen не берём: она не знает темы Windows и рисует не так,
+    как увидит человек. Окно при этом живое - с HWND, раскладкой и отрисовкой.
     """
-    import tkinter as tk
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
 
     import gui
 
-    показано = []
+    gui.create_app()
+    os.environ["COMFYUI_ROOT"] = str(root)
+    app = gui.App()
+    app.setAttribute(Qt.WA_DontShowOnScreen)
+    app.show()
+    QApplication.processEvents()
+    return app
 
-    class Диалоги:
-        @staticmethod
-        def showinfo(title, text=""):
-            показано.append(("инфо", title))
 
-        @staticmethod
-        def showerror(title, text=""):
-            показано.append(("ошибка", title))
+def закрыть_окно(app):
+    from PySide6.QtWidgets import QApplication
 
-        @staticmethod
-        def showwarning(title, text=""):
-            показано.append(("предупреждение", title))
+    if not app.closing:
+        app.worker = None
+        app.close()
+    app.deleteLater()
+    QApplication.processEvents()
 
-        @staticmethod
-        def askyesno(title, text=""):
-            показано.append(("вопрос", title))
-            return False
 
+class ОкноНаВремя:
+    """Окно плюс подмена диалогов и COMFYUI_ROOT, всё возвращается на место."""
+
+    def __init__(self, root, **диалоги):
+        self.root = root
+        self.диалоги = Диалоги(**диалоги)
+
+    def __enter__(self):
+        self.было_root = os.environ.get("COMFYUI_ROOT")
+        self.диалоги.__enter__()
+        self.app = qt_окно(self.root)
+        return self.app, self.диалоги
+
+    def __exit__(self, *_):
+        try:
+            закрыть_окно(self.app)
+        finally:
+            self.диалоги.__exit__()
+            if self.было_root is None:
+                os.environ.pop("COMFYUI_ROOT", None)
+            else:
+                os.environ["COMFYUI_ROOT"] = self.было_root
+
+
+def окно_согласовано(app):
+    """Инварианты окна, которые обязаны держаться после любого шага."""
+    качаем = app.running()
+    замок = [app.root_edit, app.browse_button, app.remove_button, *app.pick_buttons,
+             *(r.box for r in app.rows.values())]
+    открыто = {w.isEnabled() for w in замок}
+    assert len(открыто) == 1, "замок закрыл только часть кнопок выбора"
+    if not качаем:
+        assert app.download_button.isEnabled(), "«Скачать» заперта, хотя ничего не качается"
+        assert not app.cancel_button.isEnabled(), "«Отмена» жива, хотя качать нечего"
+        assert открыто == {True}, "выбор заперт, хотя ничего не качается"
+    assert app.chosen_keys() == [k for k, r in app.rows.items() if r.box.isChecked()]
+    root = app.current_root()
+    if root.is_dir():
+        очередь = core.pending(app.manifest, app.chosen_keys(), root)
+        if очередь:
+            assert app.picked_label.text().startswith(f"к скачиванию: {len(очередь)} файлов"), \
+                app.picked_label.text()
+        else:
+            assert app.picked_label.text() == "ничего не выбрано", app.picked_label.text()
+    else:
+        assert app.disk_label.text() == "папка не найдена"
+        assert app.picked_label.text() == ""
+    assert 0 <= app.file_bar.value() <= 1000 and 0 <= app.total_bar.value() <= 1000
+
+
+@case
+def the_window_builds_and_survives_every_event():
+    """Обвязка окна: сборка виджетов, насос событий, три исхода закачки и
+    замок на кнопках. Ломается она молча - окно просто не открывается или
+    остаётся с заблокированной кнопкой, и узнать об этом можно было только
+    запустив exe руками после сборки.
+    """
     root = TMP / "gui-root"
     root.mkdir(exist_ok=True)
-    было_окно, было_root = gui.messagebox, os.environ.get("COMFYUI_ROOT")
-    os.environ["COMFYUI_ROOT"] = str(root)
-    gui.messagebox = Диалоги
-
-    window = None
-    try:
-        try:
-            window = tk.Tk()
-        except tk.TclError as err:
-            raise AssertionError(f"Tk не поднялся, окно не собрать: {err}") from None
-        window.withdraw()
-        app = gui.App(window)
-
+    with ОкноНаВремя(root) as (app, диалоги):
         # Собралось ли то, что описано в models.json.
         assert set(app.rows) == set(app.manifest["groups"]), "строки групп разъехались"
+        assert app.windowTitle() == core.WINDOW_TITLE
         app.select(True)
         assert app.chosen_keys() == list(app.manifest["groups"])
+        окно_согласовано(app)
         app.select_missing()
+        окно_согласовано(app)
         app.select(False)
         assert app.chosen_keys() == []
+        окно_согласовано(app)
+
+        # Щелчок по галочке пересчитывает очередь сам, без «Проверить файлы».
+        первая = next(iter(app.rows.values()))
+        первая.box.click()
+        assert первая.picked
+        окно_согласовано(app)
+        первая.box.click()
 
         # Папка есть, папки нет - оба вида должны переживаться без исключений.
         app.refresh()
-        assert "свободно" in app.disk_label.cget("text")
-        app.root_path.set(str(TMP / "нет-такой-папки"))
-        app.apply_typed_root()
-        assert app.disk_label.cget("text") == "папка не найдена"
-        app.root_path.set(str(root))
-        app.apply_typed_root()
+        assert "свободно" in app.disk_label.text()
+        app.root_edit.setText(str(TMP / "нет-такой-папки"))
+        app.root_edit.returnPressed.emit()   # Enter в поле пути
+        assert app.disk_label.text() == "папка не найдена"
+        окно_согласовано(app)
+        assert core.saved_root() != str(TMP / "нет-такой-папки"), "запомнил несуществующую папку"
+        core.remember_root(TMP / "где-то-ещё")
+        app.root_edit.setText(str(root))
+        app.root_edit.returnPressed.emit()
+        assert "свободно" in app.disk_label.text()
+        assert Path(core.saved_root()) == root, "набранная руками папка не запомнилась"
 
         # Насос событий обязан пережить что угодно: пока он крутится, окно живо.
         bars = core.QueueProgress([SIZE, SIZE], [0, 0])
@@ -1769,98 +1874,206 @@ def the_window_builds_and_survives_every_event():
         app.events.put(("file", "какой-то файл"))
         app.events.put(("progress", bars.advance(SIZE // 2) + (1000.0,)))
         app.events.put(("мусор, которого не бывает", None))
+        app.events.put(("progress", "не кортеж"))       # обработчик упадёт, насос - нет
+        app.events.put(("log", "после сбоя"))
         app.drain_events()
-        assert app.file_bar["value"] == 500, app.file_bar["value"]
-        assert "осталось" in app.speed_label.cget("text")
+        assert app.file_bar.value() == 500, app.file_bar.value()
+        assert "осталось" in app.speed_label.text()
+        assert app.log_text.toPlainText().splitlines()[-1] == "после сбоя", \
+            "насос остановился на кривом событии"
+        assert app.pump.isActive(), "насос событий не крутится"
 
         # Три исхода закачки: успех, часть не скачалась, отмена с провалами.
-        # Перед каждым запираем окно ровно так, как это делает start(). Без
-        # этого проверка «кнопка разблокировалась» ничего не значит: она и не
-        # была заперта, и убери из finish_job строку, которая её отпускает, -
-        # проверка всё равно останется зелёной. Так и вышло с первого раза.
-        показано.clear()
+        # Перед каждым запираем окно ровно так, как это делает start(): иначе
+        # «кнопка разблокировалась» ничего не значит - она и не была заперта.
+        диалоги.показано.clear()
         for failed, cancelled in (([], False),
                                   (["models/vae/x.bin"], False),
                                   (["models/vae/x.bin"], True)):
             app.lock_controls(True)
-            app.download_button.configure(state="disabled")
-            app.cancel_button.configure(state="normal")
+            app.download_button.setEnabled(False)
+            app.cancel_button.setEnabled(True)
             app.finish_job(failed, cancelled)
-            # str() тут обязателен: ttk отдаёт из cget не строку, а объект Tcl,
-            # и сравнение с "normal" молча оказывается ложным всегда.
-            assert str(app.download_button.cget("state")) == "normal", \
-                "кнопка «Скачать» осталась запертой - окно больше ничего не умеет"
-            assert str(app.cancel_button.cget("state")) == "disabled", \
-                "«Отмена» осталась живой, хотя качать уже нечего"
-        assert [kind for kind, _ in показано] == ["инфо", "предупреждение", "предупреждение"], \
-            показано
+            окно_согласовано(app)
+        assert диалоги.виды() == ["инфо", "предупреждение", "предупреждение"], диалоги.показано
+        # Отмена без провалов молчит: человек сам нажал «Отмена».
+        диалоги.показано.clear()
+        app.finish_job([], True)
+        assert диалоги.показано == [] and app.file_label.text() == "остановлено"
 
-        # Замок на время закачки: галочки и кнопки выбора запираются вместе.
+        # Замок на время закачки: галочки, поле пути и кнопки выбора разом.
         app.lock_controls(True)
-        assert str(app.browse_button.cget("state")) == "disabled"
-        assert all(str(r.box.cget("state")) == "disabled" for r in app.rows.values())
+        assert not app.browse_button.isEnabled() and not app.root_edit.isEnabled()
+        assert all(not r.box.isEnabled() for r in app.rows.values())
+        assert all(not b.isEnabled() for b in app.pick_buttons + [app.remove_button])
         app.lock_controls(False)
-        assert str(app.browse_button.cget("state")) == "normal"
+        assert app.browse_button.isEnabled()
 
         # Старт без выбора и старт в несуществующую папку: оба обязаны
         # объясниться диалогом, а не уйти качать.
-        показано.clear()
+        диалоги.показано.clear()
         app.start()
-        assert показано == [("инфо", "Нечего качать")], показано
-        показано.clear()
+        assert [(в, з) for в, з, _ in диалоги.показано] == [("инфо", "Нечего качать")], диалоги.показано
+        диалоги.показано.clear()
         app.select(True)
-        app.root_path.set(str(TMP / "нет-такой-папки"))
+        app.root_edit.setText(str(TMP / "нет-такой-папки"))
         app.start()
-        assert показано == [("ошибка", "Папка не найдена")], показано
+        assert [(в, з) for в, з, _ in диалоги.показано] == [("ошибка", "Папка не найдена")], \
+            диалоги.показано
         assert app.worker is None, "ушёл качать в несуществующую папку"
 
+        # «Нет» на вопросе «Начинаем?» - поток не стартует, окно не запирается.
+        app.root_edit.setText(str(root))
+        app.refresh()
+        диалоги.показано.clear()
+        диалоги.ответ = False
+        app.start()
+        assert диалоги.виды() == ["вопрос"], диалоги.показано
+        assert app.worker is None, "ушёл качать после «Нет»"
+        окно_согласовано(app)
+        app.select(False)
+
         # «Обзор»: выбор папки запоминается так же, как набранный руками.
-        было_диалог = gui.filedialog
-        gui.filedialog = type("Ф", (), {"askdirectory": staticmethod(
-            lambda **kw: str(root))})
-        try:
-            app.pick_folder()
-        finally:
-            gui.filedialog = было_диалог
-        assert app.root_path.get() == str(root)
+        # Отказ от выбора (пустая строка) ничего не меняет.
+        core.remember_root(TMP / "где-то-ещё")
+        диалоги.папка = ""
+        app.pick_folder()
+        assert app.root_edit.text() == str(root)
+        диалоги.папка = str(root).replace("\\", "/")  # Qt отдаёт путь с прямыми слешами
+        app.pick_folder()
+        assert app.root_edit.text() == str(root), app.root_edit.text()
+        assert Path(core.saved_root()) == root, "папка из «Обзора» не запомнилась"
 
         # «Отмена»: поднимает флаг для потока и запирает себя, чтобы второй раз
         # не нажали. Сам поток при этом дожимает текущий кусок.
         app.stop_flag.clear()
-        app.cancel_button.configure(state="normal")
+        app.cancel_button.setEnabled(True)
         app.cancel()
         assert app.stop_flag.is_set(), "флаг отмены не поднялся, поток не остановится"
-        assert str(app.cancel_button.cget("state")) == "disabled"
+        assert not app.cancel_button.isEnabled()
 
-        # Закрытие: без живого потока обязано пройти без вопросов и погасить
-        # насос событий, иначе он сработает на уже разрушенном окне.
-        показано.clear()
-        app.rows.clear()
-        app.root_path = None
-        app.on_close()
-        assert показано == [], f"закрытие без закачки не должно ничего спрашивать: {показано}"
-        assert app.closing is True
-        window = None    # окно уже разрушено самим on_close
-    finally:
-        gui.messagebox = было_окно
-        if было_root is None:
-            os.environ.pop("COMFYUI_ROOT", None)
-        else:
-            os.environ["COMFYUI_ROOT"] = было_root
-        if window is not None:
-            # Переменные Tk (BooleanVar галочек, StringVar пути) на разрушении
-            # окна не исчезают - их прибирает сборщик мусора, уже когда Tk
-            # мёртв, и каждая печатает "main thread is not in main loop".
-            # Прогон от этого не падает, но экран засыпается трассировками, а
-            # код возврата становится ненадёжным - и сборка отказывается идти.
-            # Роняем их руками, пока Tk ещё жив.
-            for row in app.rows.values():
-                row.picked = None
-            app.rows.clear()
-            app.root_path = None
-            gc.collect()
-            window.destroy()
-            gc.collect()
+        # Установщик ищет запущенную программу по заголовку через FindWindow.
+        # Сверяем не строку в исходнике, а живое окно, как его видит Windows.
+        import ctypes
+
+        app.winId()
+        найдено = ctypes.windll.user32.FindWindowW(None, core.WINDOW_TITLE)
+        assert найдено, "FindWindow не находит окно по заголовку - установщик затрёт запущенную программу"
+
+        # Закрытие во время закачки спрашивает, по умолчанию «Нет», и на «Нет»
+        # окно остаётся открытым.
+        class Живой:
+            @staticmethod
+            def is_alive():
+                return True
+
+            @staticmethod
+            def join(timeout=None):
+                pass
+
+        app.worker = Живой
+        диалоги.показано.clear()
+        диалоги.ответ = False
+        app.close()
+        assert диалоги.виды() == ["вопрос"] and диалоги.по_умолчанию_нет
+        assert not app.closing and app.isVisible(), "закрылось после «Нет»"
+        app.stop_flag.clear()
+        диалоги.ответ = True
+        app.close()
+        assert app.closing and app.stop_flag.is_set(), "закрылось, не остановив поток"
+        assert not app.pump.isActive(), "насос событий пережил окно"
+
+
+@case
+def the_window_closes_quietly_without_a_download():
+    root = TMP / "gui-root"
+    root.mkdir(exist_ok=True)
+    with ОкноНаВремя(root) as (app, диалоги):
+        app.close()
+        assert диалоги.показано == [], f"закрытие без закачки не должно ничего спрашивать: {диалоги.показано}"
+        assert app.closing and not app.pump.isActive()
+
+
+@case
+def the_window_survives_random_clicking():
+    """Случайные последовательности действий: галочки, кнопки выбора, путь,
+    события потока, исходы закачки. После каждого шага держатся инварианты
+    окна_согласовано: замок целиком, кнопки по состоянию, подпись очереди
+    совпадает с тем, что посчитал бы core.pending."""
+    import random
+
+    root = TMP / "gui-root"
+    root.mkdir(exist_ok=True)
+    чужая = TMP / "нет-такой-папки"
+    with ОкноНаВремя(root) as (app, диалоги):
+        случай = random.Random(7)
+        строки = list(app.rows.values())
+        bars = core.QueueProgress([SIZE] * 3, [0, SIZE // 3, 0])
+        bars.start_file(0)
+        for шаг in range(300):
+            что = случай.choice(["галочка", "всё", "ничего", "недостающие", "обновить",
+                                 "папка", "чужая", "событие", "исход", "замок", "старт", "удалить"])
+            if что == "галочка":
+                случай.choice(строки).box.click()
+            elif что == "всё":
+                app.pick_buttons[0].click()
+            elif что == "ничего":
+                app.pick_buttons[1].click()
+            elif что == "недостающие":
+                app.pick_buttons[2].click()
+            elif что == "обновить":
+                app.check_button.click()
+            elif что == "папка":
+                app.root_edit.setText(str(root))
+                app.root_edit.returnPressed.emit()
+            elif что == "чужая":
+                app.root_edit.setText(str(чужая))
+                app.root_edit.returnPressed.emit()
+            elif что == "событие":
+                done = случай.randint(0, SIZE)
+                app.events.put(("progress", bars.advance(done) + (случай.choice([0, 0.5, 5e6]),)))
+                app.events.put(("log", f"шаг {шаг}"))
+                app.drain_events()
+            elif что == "исход":
+                app.lock_controls(True)
+                app.download_button.setEnabled(False)
+                app.cancel_button.setEnabled(True)
+                app.finish_job(случай.choice([[], ["x"]]), случай.random() < 0.5)
+            elif что == "замок":
+                app.lock_controls(True)
+                app.lock_controls(False)
+            elif что == "старт":
+                диалоги.ответ = False       # до вопроса доходит, но качать не уходит
+                app.start()
+                assert app.worker is None
+            elif что == "удалить":
+                диалоги.ответ = False
+                app.remove()
+            окно_согласовано(app)
+        assert "вопрос" in диалоги.виды(), "случайный прогон ни разу не дошёл до вопроса"
+
+
+@case
+def the_window_resizes_fast():
+    """Ради этого окно и переехало с tkinter на Qt: при ресайзе Tk
+    перерисовывал каждый виджет отдельным окном Windows, и тормозило заметно.
+    Бюджет на шаг с полной отрисовкой окна - 40 мс (на машине разработки
+    около 10); у Tk было за сотню."""
+    from PySide6.QtWidgets import QApplication
+
+    root = TMP / "gui-root"
+    root.mkdir(exist_ok=True)
+    with ОкноНаВремя(root) as (app, _):
+        app.grab()                          # первая отрисовка грузит шрифты и стиль
+        размеры = [(720 + (n * 37) % 500, 560 + (n * 53) % 400) for n in range(30)]
+        начало = time.perf_counter()
+        for w, h in размеры:
+            app.resize(w, h)
+            QApplication.processEvents()
+            app.grab()
+        на_шаг = (time.perf_counter() - начало) / len(размеры) * 1000
+        assert на_шаг < 40, f"шаг ресайза {на_шаг:.1f} мс"
+        assert app.width() >= 720 and app.height() >= 560
 
 
 @case
@@ -1946,55 +2159,21 @@ def the_delete_button_never_fires_without_a_yes():
 
     Проверяем не то, что она удаляет, а то, когда она удалять отказывается:
     без подтверждения, во время закачки, в несуществующей папке. И что в
-    вопросе назван объём - «удалить?» без цифры человек прожмёт не глядя.
+    вопросе назван объём - «удалить?» без цифры человек прожмёт не глядя, - а
+    кнопка по умолчанию в нём «Нет».
     """
-    import tkinter as tk
-
-    import gui
-
-    спросили = []
-
-    class Диалоги:
-        ответ = False
-
-        @staticmethod
-        def showinfo(title, text=""):
-            спросили.append(("инфо", title, text))
-
-        @staticmethod
-        def showerror(title, text=""):
-            спросили.append(("ошибка", title, text))
-
-        @staticmethod
-        def showwarning(title, text=""):
-            спросили.append(("предупреждение", title, text))
-
-        @staticmethod
-        def askyesno(title, text=""):
-            спросили.append(("вопрос", title, text))
-            return Диалоги.ответ
-
     root = разложить_для_удаления(TMP / "снос-окно")
-    было_окно, было_root = gui.messagebox, os.environ.get("COMFYUI_ROOT")
-    os.environ["COMFYUI_ROOT"] = str(root)
-    gui.messagebox = Диалоги
-    window = None
-    try:
-        try:
-            window = tk.Tk()
-        except tk.TclError as err:
-            raise AssertionError(f"Tk не поднялся: {err}") from None
-        window.withdraw()
-        app = gui.App(window)
+    with ОкноНаВремя(root) as (app, диалоги):
         app.manifest = УДАЛЕНИЕ          # свой манифест, чтобы не сносить настоящее
         app.rows = {}                    # строки от настоящего манифеста тут ни к чему
         app.chosen_keys = lambda: ["первая"]
 
         # Сказали «нет» - не должно пропасть ничего.
-        Диалоги.ответ = False
+        диалоги.ответ = False
         app.remove()
-        вид, заголовок, текст = спросили[-1]
-        assert вид == "вопрос", спросили
+        вид, заголовок, текст = диалоги.показано[-1]
+        assert вид == "вопрос", диалоги.показано
+        assert диалоги.по_умолчанию_нет, "Enter в вопросе об удалении сносит модели"
         assert "необратимо" in текст, "в вопросе не сказано, что это навсегда"
         # 100 за один.bin, 50 за его недокачанный кусок, 200 за два.bin.
         # Общий файл в объём не входит: он пропускается, и обещать его место
@@ -2004,8 +2183,8 @@ def the_delete_button_never_fires_without_a_yes():
         assert (root / "models/vae/один.bin").exists(), "удалил после «нет»"
 
         # Идёт закачка - удалять нельзя вообще, даже не спрашивая.
-        спросили.clear()
-        Диалоги.ответ = True
+        диалоги.показано.clear()
+        диалоги.ответ = True
 
         class Живой:
             @staticmethod
@@ -2014,69 +2193,49 @@ def the_delete_button_never_fires_without_a_yes():
 
         app.worker = Живой
         app.remove()
-        assert [в for в, _, _ in спросили] == ["инфо"], спросили
+        assert диалоги.виды() == ["инфо"], диалоги.показано
         assert (root / "models/vae/один.bin").exists(), "удалил во время закачки"
         app.worker = None
 
         # Папки нет - тоже отказ.
-        спросили.clear()
-        app.root_path.set(str(TMP / "нет-такой-папки"))
+        диалоги.показано.clear()
+        app.root_edit.setText(str(TMP / "нет-такой-папки"))
         app.remove()
-        assert [в for в, _, _ in спросили] == ["ошибка"], спросили
-        app.root_path.set(str(root))
+        assert диалоги.виды() == ["ошибка"], диалоги.показано
+        app.root_edit.setText(str(root))
 
         # И только теперь, по явному «да», удаляет - и не трогает лишнего.
-        спросили.clear()
+        диалоги.показано.clear()
         app.remove()
         assert not (root / "models/vae/один.bin").exists(), "не удалил по «да»"
         assert (root / "models/vae/общий.bin").exists(), "снёс общий файл"
         assert (root / "models" / "чужое.txt").exists(), "снёс посторонний файл"
+        assert "удалено файлов" in app.log_text.toPlainText()
 
-        app.root_path = None
-        app.closing = True
-    finally:
-        gui.messagebox = было_окно
-        if было_root is None:
-            os.environ.pop("COMFYUI_ROOT", None)
-        else:
-            os.environ["COMFYUI_ROOT"] = было_root
-        if window is not None:
-            gc.collect()
-            window.destroy()
-            gc.collect()
+        # Второй раз удалять уже нечего - так и говорим, без вопроса.
+        диалоги.показано.clear()
+        app.remove()
+        assert диалоги.виды() == ["инфо"], диалоги.показано
 
 
 @case
 def the_clipboard_survives_the_window_closing():
-    """Tk отдаёт буфер обмена по запросу и только пока окно живо.
+    """Кнопка «Копировать» рассчитана ровно на то, чтобы скопировать название и
+    уйти в LM Studio, то есть закрыв окно. Qt отдаёт строку системе сам, а мы
+    проверяем, что она вообще туда ушла - и что кнопок столько же, сколько
+    моделей LM Studio в манифесте."""
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtWidgets import QApplication
 
-    Кнопка «Копировать» рассчитана ровно на то, чтобы скопировать название и
-    уйти в LM Studio, то есть закрыв окно. Починка была, а сторожа у неё не
-    было: проверялась она черновым скриптом, в прогон не попала.
-    """
-    import tkinter as tk
-
-    import gui
-
-    window = None
-    try:
-        try:
-            window = tk.Tk()
-        except tk.TclError as err:
-            raise AssertionError(f"Tk не поднялся: {err}") from None
-        window.withdraw()
-        app = gui.App(window)
-        app.copy("lmstudio-community/gemma-4-E2B-it-GGUF")
-        assert window.clipboard_get() == "lmstudio-community/gemma-4-E2B-it-GGUF"
-        assert "скопировано" in app.log_text.get("1.0", "end")
-        app.rows.clear()
-        app.root_path = None
-        app.closing = True
-    finally:
-        if window is not None:
-            gc.collect()
-            window.destroy()
-            gc.collect()
+    root = TMP / "gui-root"
+    root.mkdir(exist_ok=True)
+    with ОкноНаВремя(root) as (app, _):
+        assert len(app.copy_buttons) == len(app.manifest.get("lmstudio", []))
+        первая = app.manifest["lmstudio"][0]["search"]
+        app.copy_buttons[0].click()
+        QApplication.processEvents()
+        assert QGuiApplication.clipboard().text() == первая
+        assert "скопировано" in app.log_text.toPlainText()
 
 
 @case
@@ -2107,6 +2266,46 @@ def the_build_lays_out_what_people_read():
     # Повторная раскладка поверх готовой папки обязана проходить: установка
     # поверх старой версии делает ровно это.
     build.lay_out_extras(куда)
+
+
+@case
+def the_portable_zip_is_the_installed_folder():
+    """Portable с версии 2.0 - та же папка, что уходит в установщик, в zip.
+
+    Обрезка Qt обязана убрать программный OpenGL и чужие переводы, но оставить
+    русский: без него кнопки в диалогах будут «Yes» и «No». А в архиве, кроме
+    exe, обязаны лежать models.json, README и docs - ровно как после установки.
+    """
+    import zipfile
+
+    import build
+
+    папка = TMP / "сборка" / core.APP
+    qt = папка / "_internal" / "PySide6"
+    (qt / "translations").mkdir(parents=True, exist_ok=True)
+    for name in ("opengl32sw.dll", "Qt6Core.dll"):
+        (qt / name).write_bytes(b"x")
+    for name in ("qtbase_ru.qm", "qtbase_de.qm", "qt_help_ru.qm"):
+        (qt / "translations" / name).write_bytes(b"x")
+    (папка / f"{core.APP}.exe").write_bytes(b"MZ")
+    build.lay_out_extras(папка)
+
+    build.trim_qt(папка)
+    assert not (qt / "opengl32sw.dll").exists(), "программный OpenGL остался"
+    assert (qt / "Qt6Core.dll").exists(), "обрезка снесла сам Qt"
+    assert sorted(p.name for p in (qt / "translations").iterdir()) == ["qtbase_ru.qm"]
+    build.trim_qt(папка)   # повторная обрезка ничего не ломает
+
+    архив = build.zip_portable(папка, TMP / f"{core.APP}-portable-{core.VERSION}.zip")
+    assert архив.name == f"{core.APP}-portable-{core.VERSION}.zip", архив
+    with zipfile.ZipFile(архив) as z:
+        имена = set(z.namelist())
+    for нужно in (f"{core.APP}/{core.APP}.exe", f"{core.APP}/models.json",
+                  f"{core.APP}/README.md", f"{core.APP}/docs/build.md"):
+        assert нужно in имена, f"в portable нет {нужно}"
+    # Поверх старого архива собирается новый, а не дописывается в него.
+    архив2 = build.zip_portable(папка, архив)
+    assert архив2 == архив and zipfile.ZipFile(архив).testzip() is None
 
 
 @case

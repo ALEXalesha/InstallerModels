@@ -5,13 +5,14 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
 import urllib.request
 from collections import namedtuple
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 RETRIES = 5
 CHUNK = 1 << 20
@@ -31,7 +32,7 @@ TIMEOUT = 60
 # заводить. NSIS читать Python не умеет, поэтому build.py кладёт ему эти же
 # три строки в version.nsh перед сборкой.
 APP = "InstallerModels"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 # Установщик ищет запущенную программу по заголовку окна через FindWindow.
 WINDOW_TITLE = f"{APP} - модели для ComfyUI"
 FROZEN = getattr(sys, "frozen", False)
@@ -344,6 +345,11 @@ def api_url(repo):
     return f"{HF_HOST}/api/models/{quote(repo)}/tree/main?recursive=1"
 
 
+def card_url(repo):
+    """Карточка модели: автор, теги, cardData с base_model."""
+    return f"{HF_HOST}/api/models/{quote(repo)}"
+
+
 def next_page(link_header):
     """Hugging Face режет длинные описи на страницы и даёт ссылку в Link.
     Без этого репозиторий на сотню файлов молча вернул бы первую сотню, а
@@ -355,6 +361,52 @@ def next_page(link_header):
     return None
 
 
+def hf_json(url):
+    """Запрос к API Hugging Face: разобранный ответ и ссылка на следующую страницу.
+
+    Один на все обращения к API - и на опись репозитория, и на его карточку.
+    Раньше эти двадцать строк с разбором кодов ответа жили внутри repo_listing, и
+    добавление второго запроса означало бы их копию: 401 и 403 с советом про
+    HF_TOKEN, 404 отдельно от прочих кодов, обрыв связи отдельно от HTTP.
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": "InstallerModels/1.0",
+                                               "Accept-Encoding": "identity"})
+    token = hf_token()
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        resp = urllib.request.urlopen(req, timeout=TIMEOUT)
+    except urllib.error.HTTPError as err:
+        if err.code in (401, 403):
+            raise RuntimeError(
+                f"HTTP {err.code} - репозиторий закрыт или требует лицензии, "
+                f"прими её на странице модели и положи токен в HF_TOKEN"
+            ) from None
+        if err.code == 404:
+            raise RuntimeError(
+                "репозиторий не найден: проверь ссылку или repo в models.json"
+            ) from None
+        raise RuntimeError(f"Hugging Face ответил {err.code}") from None
+    except NETWORK_ERRORS as err:
+        raise RuntimeError(f"нет связи с Hugging Face: {err}") from None
+    with resp:
+        try:
+            data = json.load(resp)
+        except ValueError as err:
+            raise RuntimeError(f"ответ Hugging Face не разбирается: {err}") from None
+        return data, next_page(resp.headers.get("Link"))
+
+
+def repo_card(repo):
+    """Карточка репозитория: то, что Hugging Face знает о модели помимо файлов.
+
+    Нужна ровно ради base_model - по ней выводится ключ модели для «lms load».
+    Страниц у карточки не бывает, вторая половина ответа отбрасывается.
+    """
+    card, _ = hf_json(card_url(repo))
+    return card if isinstance(card, dict) else {}
+
+
 def repo_listing(repo):
     """Что сейчас лежит в репозитории: путь -> размер в байтах.
 
@@ -364,30 +416,7 @@ def repo_listing(repo):
     """
     found, url = {}, api_url(repo)
     while url:
-        req = urllib.request.Request(url, headers={"User-Agent": "InstallerModels/1.0",
-                                                   "Accept-Encoding": "identity"})
-        token = hf_token()
-        if token:
-            req.add_header("Authorization", f"Bearer {token}")
-        try:
-            resp = urllib.request.urlopen(req, timeout=TIMEOUT)
-        except urllib.error.HTTPError as err:
-            if err.code in (401, 403):
-                raise RuntimeError(
-                    f"HTTP {err.code} - репозиторий закрыт или требует лицензии, "
-                    f"прими её на странице модели и положи токен в HF_TOKEN"
-                ) from None
-            if err.code == 404:
-                raise RuntimeError("репозиторий не найден, проверь repo в models.json") from None
-            raise RuntimeError(f"Hugging Face ответил {err.code}") from None
-        except NETWORK_ERRORS as err:
-            raise RuntimeError(f"нет связи с Hugging Face: {err}") from None
-        with resp:
-            try:
-                page = json.load(resp)
-            except ValueError as err:
-                raise RuntimeError(f"опись репозитория не разбирается: {err}") from None
-            url = next_page(resp.headers.get("Link"))
+        page, url = hf_json(url)
         if not isinstance(page, list):
             raise RuntimeError("опись репозитория пришла не списком")
         for item in page:
@@ -502,6 +531,315 @@ def save_manifest(manifest, path):
     неизменённом манифесте запись даёт те же байты, что и были."""
     text = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
     Path(path).write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+
+
+# -------------------------------------------------- свои модели по ссылке на HF
+
+# Что человек копирует из адресной строки. Ветка только main - её же зовёт
+# hf_url(), и обещать скачивание из другой было бы неправдой.
+HF_HOSTS = ("huggingface.co", "www.huggingface.co", "hf.co")
+REF_KINDS = ("resolve", "blob", "raw", "tree")
+REPO_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+# «example.com» - это хост, а «model.v2» - имя репозитория. Отличаем по концу:
+# у хоста после последней точки стоит домен из букв. Правило нашла гипотеза,
+# предложив автора по имени «a.» - точка в имени сама по себе хостом не делает.
+ПОХОЖЕ_НА_ХОСТ = re.compile(r"\.[A-Za-z]{2,}$")
+
+Ref = namedtuple("Ref", "repo path folder")
+
+
+def parse_hf_ref(text, need_file=True):
+    """Разбирает ссылку на Hugging Face или короткое «автор/репозиторий/путь».
+
+    Из адресной строки копируют вместе с хвостом ?download=true, якорем и
+    процентными кодами - всё это отрезается и разворачивается. Понимаются
+    /resolve/, /blob/, /raw/ и /tree/, адрес api/models/... и короткая запись
+    без хоста: человек копирует то, что видит, а видит он это в пяти видах.
+
+    Ветка обязана быть main. Скачивание умеет только её (см. hf_url), и принять
+    ссылку на другую значило бы пообещать то, чего программа не делает.
+    """
+    text = (text or "").strip().strip('"').strip("'")
+    if not text:
+        raise ValueError("пустая ссылка")
+    text = unquote(text.split("#", 1)[0].split("?", 1)[0])
+    со_схемой = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", text) is not None
+    text = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", text).strip("/")
+    первый = text.split("/", 1)[0].lower()
+    хост = next((h for h in HF_HOSTS if первый == h), None)
+    if хост:
+        text = text[len(хост) + 1:]
+    elif со_схемой or ПОХОЖЕ_НА_ХОСТ.search(первый):
+        # Чужой хост - это не опечатка в имени автора, а ссылка не туда: качает
+        # программа только с Hugging Face, и «автор» вида example.com был бы
+        # молчаливой подменой смысла ссылки.
+        raise ValueError(
+            f"ссылка не на Hugging Face: {первый} - программа качает только с "
+            f"huggingface.co"
+        )
+    parts = [p for p in text.split("/") if p and p != "."]
+    if parts[:2] == ["api", "models"]:
+        parts = parts[2:]
+    if parts[:1] == ["models"]:
+        parts = parts[1:]
+    if parts[:1] in (["datasets"], ["spaces"]):
+        raise ValueError(f"это {parts[0]}, а не модель: ссылка должна вести на модель")
+
+    if len(parts) < 2 or not all(REPO_PART.fullmatch(p) for p in parts[:2]):
+        raise ValueError(
+            f"не похоже на ссылку Hugging Face: {text!r} - нужен адрес вида "
+            f"https://huggingface.co/автор/репозиторий/resolve/main/файл"
+        )
+    repo, rest = "/".join(parts[:2]), parts[2:]
+    folder = False
+    if rest and rest[0] in REF_KINDS:
+        kind, revision, rest = rest[0], (rest[1] if len(rest) > 1 else "main"), rest[2:]
+        folder = kind == "tree"
+        if revision != "main":
+            raise ValueError(
+                f"ветка {revision!r}: программа качает только main, "
+                f"возьми ссылку с /resolve/main/"
+            )
+    path = "/".join(rest)
+    if need_file and (folder or not path):
+        raise ValueError(
+            "в ссылке нет файла, только репозиторий: открой сам файл и возьми "
+            "ссылку на него (кнопка «download» или адрес с /resolve/main/)"
+        )
+    return Ref(repo, path, folder)
+
+
+# Куда ComfyUI смотрит сам. Порядок важен: сначала папка из пути внутри
+# репозитория - там автор уже разложил файлы так, как их кладут, - и только
+# потом догадки по имени.
+COMFY_FOLDERS = ("checkpoints", "loras", "vae", "text_encoders", "clip_vision",
+                 "clip", "unet", "diffusion_models", "controlnet", "upscale_models",
+                 "latent_upscale_models", "embeddings", "style_models", "vae_approx",
+                 "gligen", "hypernetworks", "photomaker")
+
+NAME_HINTS = ((("clip_vision", "clip-vit"), "clip_vision"),
+              (("lora", "_lcm", "lightning"), "loras"),
+              (("vae",), "vae"),
+              (("text_encoder", "umt5", "_t5", "t5xxl", "clip_l", "clip_g", "llava"),
+               "text_encoders"),
+              (("upscal", "esrgan"), "upscale_models"),
+              (("controlnet",), "controlnet"))
+
+
+def suggest_dest(path):
+    """Куда в ComfyUI обычно кладут такой файл.
+
+    Это догадка, и она названа догадкой везде, где показывается: и окно, и
+    консоль печатают получившийся dest до записи, и его можно задать руками.
+    Ошибиться тут дёшево - файл ляжет не в ту папку ComfyUI, и воркфлоу его не
+    увидит, - а угадывается он в подавляющем большинстве случаев верно, потому
+    что в репозиториях уже лежит split_files/text_encoders/... и подобное.
+    """
+    name = path.rsplit("/", 1)[-1]
+    for folder in reversed([p.lower() for p in path.split("/")[:-1]]):
+        if folder in COMFY_FOLDERS:
+            return f"models/{folder}/{name}"
+    low = name.lower()
+    for hints, folder in NAME_HINTS:
+        if any(hint in low for hint in hints):
+            return f"models/{folder}/{name}"
+    # GGUF в ComfyUI - это квантованный unet для GGUF-нод, а не чекпойнт.
+    return f"models/{'unet' if low.endswith('.gguf') else 'checkpoints'}/{name}"
+
+
+CUSTOM_GROUP = "custom"
+CUSTOM_TITLES = ("Added by hand", "Добавленные вручную")
+
+Added = namedtuple("Added", "group dest repo path size sha256 new_group guessed")
+
+
+def add_model(manifest, text, group=None, dest=None, listing=None):
+    """Добавляет в манифест файл по ссылке на Hugging Face.
+
+    Размер и sha256 не спрашиваются у человека и не выдумываются: они берутся из
+    описи репозитория - той же, по которой работает --sync-manifest. Поэтому
+    добавленная запись с первой секунды проверяется ровно так же, как те
+    пятнадцать, что лежали в манифесте изначально.
+
+    Неудача не меняет манифест. Если после добавления check_manifest недоволен -
+    запись убирается обратно вместе с созданной группой, и наружу идёт его
+    объяснение: половина записи в манифесте хуже, чем её отсутствие.
+    """
+    ref = parse_hf_ref(text)
+    files = (listing or repo_listing)(ref.repo)
+    remote = files.get(ref.path)
+    if remote is None:
+        похожие = [p for p in files if p.rsplit("/", 1)[-1] == ref.path.rsplit("/", 1)[-1]]
+        подсказка = f"; в репозитории есть {похожие[0]}" if похожие else ""
+        raise ValueError(f"в репозитории {ref.repo} нет файла {ref.path}{подсказка}")
+
+    guessed = dest is None
+    dest = dest or suggest_dest(ref.path)
+    try:
+        dest_parts(dest)
+    except ValueError as err:
+        # Ссылку вставил человек, а не правил манифест руками: жаловаться на
+        # «плохой dest в models.json» тут значит указать не на ту причину.
+        # Имя файла в репозитории Windows действительно может не сохранить -
+        # тогда нужно своё имя, и об этом надо сказать прямо.
+        подробности = str(err).split(" - ", 1)[-1]
+        raise ValueError(
+            f"так файл на диск не положить: {подробности}. "
+            f"Задай путь сам: --dest models/папка/имя{Path(ref.path).suffix}"
+        ) from None
+    for name, существующая in manifest["groups"].items():
+        for entry in существующая["files"]:
+            if entry["dest"] == dest:
+                raise ValueError(f"файл {dest} уже есть в группе {name}")
+            if entry["repo"] == ref.repo and entry["path"] == ref.path:
+                raise ValueError(
+                    f"этот же файл уже добавлен в группу {name} как {entry['dest']}"
+                )
+
+    key = group or CUSTOM_GROUP
+    new_group = key not in manifest["groups"]
+    entry = {"dest": dest, "repo": ref.repo, "path": ref.path, "size": remote.size}
+    if remote.sha256:
+        entry["sha256"] = remote.sha256
+    if new_group:
+        title, title_ru = CUSTOM_TITLES
+        manifest["groups"][key] = {"title": title, "title_ru": title_ru, "files": []}
+    manifest["groups"][key]["files"].append(entry)
+    try:
+        check_manifest(manifest)
+    except ValueError:
+        manifest["groups"][key]["files"].remove(entry)
+        if new_group:
+            del manifest["groups"][key]
+        raise
+    return Added(key, dest, ref.repo, ref.path, remote.size, remote.sha256,
+                 new_group, guessed)
+
+
+# Квант читается из имени файла - другого места у GGUF для него нет. Скобки
+# по краям не выдумка: в Qwen3-VL-4B-Instruct-Q4_K_M.gguf «Q4» без них нашлось
+# бы и внутри слова, а из mmproj-...-F16.gguf квант брать нельзя вовсе.
+QUANT = re.compile(r"(?:^|[-_.])(IQ\d[A-Za-z0-9_]*|Q\d_[A-Za-z0-9_]+|Q\d|BF16|F16|F32|MXFP4)"
+                   r"(?=[-_.]|$)", re.IGNORECASE)
+# Чем LM Studio по умолчанию и пользуются: Q4_K_M - обычный размен качества на
+# память. Если его в репозитории нет, берётся первый по этому списку.
+QUANT_ORDER = ("Q4_K_M", "Q4_K_S", "Q5_K_M", "Q5_K_S", "Q6_K", "Q8_0", "Q3_K_M")
+LMS_SUFFIXES = ("-instruct", "-it", "-chat")
+
+AddedModel = namedtuple("AddedModel", "search quant key files total guessed")
+
+
+def quant_of(name):
+    """Квант из имени файла. Берётся последнее совпадение, а не первое.
+
+    Квант стоит в конце имени, а в начале запросто окажется что-то похожее:
+    в Qwen3-Q8-preview-Q4_K_M.gguf первое совпадение - Q8, и модель была бы
+    записана в манифест не тем квантом, которым её скачают. Нашла это гипотеза
+    в tests_props.py, перебирая имена моделей.
+    """
+    found = QUANT.findall(name.rsplit("/", 1)[-1].rsplit(".", 1)[0])
+    return found[-1].upper() if found else None
+
+
+def lms_key_from_base(base):
+    """Ключ модели в LM Studio по базовой модели из карточки репозитория.
+
+    Это догадка, и она помечена догадкой в отчёте. Выводится она по двум
+    настоящим примерам: google/gemma-4-E2B-it -> google/gemma-4-e2b и
+    Qwen/Qwen3-VL-4B-Instruct -> qwen/qwen3-vl-4b, то есть нижний регистр плюс
+    срезанный суффикс варианта. Ключ необязателен: без него программа работает
+    как раньше, просто в окне не будет строчки «ключ модели в LM Studio».
+    """
+    key = str(base).strip().lower()
+    for suffix in LMS_SUFFIXES:
+        if key.endswith(suffix):
+            key = key[:-len(suffix)]
+            break
+    return key or None
+
+
+def card_base_model(card):
+    """base_model из карточки: строка, список или ничего."""
+    data = card.get("cardData") if isinstance(card, dict) else None
+    base = data.get("base_model") if isinstance(data, dict) else None
+    if isinstance(base, list):
+        base = base[0] if base else None
+    return base if isinstance(base, str) and "/" in base else None
+
+
+def add_lmstudio(manifest, text, listing=None, card=None):
+    """Добавляет модель в раздел LM Studio по ссылке на GGUF-репозиторий.
+
+    Настройки модели программа выясняет сама, а не спрашивает: файлы и их точные
+    размеры с контрольными суммами берутся из описи репозитория, квант читается
+    из имени выбранного файла, спутник mmproj (без него картинки на входе не
+    работают) подбирается по имени, а ключ для «lms load» выводится из базовой
+    модели в карточке репозитория. Что именно выведено догадкой, а не прочитано,
+    перечислено в guessed - и окно с консолью это показывают.
+    """
+    ref = parse_hf_ref(text, need_file=False)
+    files = (listing or repo_listing)(ref.repo)
+    gguf = {p: r for p, r in files.items() if p.lower().endswith(".gguf")}
+    if not gguf:
+        raise ValueError(
+            f"в репозитории {ref.repo} нет ни одного .gguf - "
+            f"LM Studio читает GGUF, возьми репозиторий с квантованными файлами"
+        )
+    спутники = {p: r for p, r in gguf.items() if p.rsplit("/", 1)[-1].lower().startswith("mmproj")}
+    основные = {p: r for p, r in gguf.items() if p not in спутники}
+    if ref.path and not ref.folder:
+        if ref.path not in gguf:
+            raise ValueError(f"в репозитории {ref.repo} нет файла {ref.path}")
+        main = ref.path
+        guessed = []
+    else:
+        by_quant = {quant_of(p): p for p in sorted(основные, reverse=True)}
+        main = next((by_quant[q] for q in QUANT_ORDER if q in by_quant),
+                    sorted(основные or gguf)[0])
+        guessed = ["файл"]
+
+    quant = quant_of(main)
+    if quant is None:
+        raise ValueError(
+            f"по имени {main} не понять квант: возьми ссылку прямо на нужный "
+            f"файл, например ...-Q4_K_M.gguf"
+        )
+    выбранные = [main]
+    # Спутник берётся к той же модели: у репозитория с несколькими вариантами
+    # mmproj один на всех, но проверить имя дешевле, чем притащить чужой.
+    спутник = next((p for p in sorted(спутники)), None)
+    if спутник:
+        выбранные.append(спутник)
+        guessed.append("mmproj")
+
+    key = None
+    база = card_base_model((card or repo_card)(ref.repo))
+    if база:
+        key = lms_key_from_base(база)
+        guessed.append("ключ")
+
+    записи = []
+    for path in выбранные:
+        запись = {"name": path.rsplit("/", 1)[-1], "size": files[path].size}
+        if files[path].sha256:
+            запись["sha256"] = files[path].sha256
+        записи.append(запись)
+
+    for модель in manifest.get("lmstudio", []):
+        if модель["search"] == ref.repo:
+            raise ValueError(f"модель {ref.repo} уже есть в разделе LM Studio")
+
+    модель = {"search": ref.repo, "quant": quant, "files": записи}
+    if key:
+        модель["lms_key"] = key
+    manifest.setdefault("lmstudio", []).append(модель)
+    try:
+        check_manifest(manifest)
+    except ValueError:
+        manifest["lmstudio"].remove(модель)
+        raise
+    return AddedModel(ref.repo, quant, key, [з["name"] for з in записи],
+                      sum(з["size"] for з in записи), guessed)
 
 
 def part_path(dest):

@@ -30,5 +30,5 @@ jobs:
       - name: Зависимости
         run: pip install -r requirements.txt
 
-      - name: 64 проверки
+      - name: 65 проверок
         run: python tests.py

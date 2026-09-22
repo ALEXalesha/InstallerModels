@@ -1788,16 +1788,58 @@ def закрыть_окно(app):
     QApplication.processEvents()
 
 
+def gui_модуль():
+    import gui
+
+    return gui
+
+
+class МногоМеста:
+    """Свободное место на время проверок окна - выдуманное, и это не поблажка.
+
+    Окно перед стартом спрашивает shutil.disk_usage и на нехватке места вместо
+    вопроса «Начинаем?» показывает «Мало места». То есть проверки молча требовали,
+    чтобы на машине было свободно 95.4 ГиБ - весь манифест. На раннере GitHub их
+    31.7, и два прогона упали, хотя в программе ничего не сломалось.
+
+    Проверять тут надо поведение окна, а не диск под ним. Нехватка места живёт в
+    своей проверке, у консоли, где место подменяется ровно так же - нулём.
+    """
+
+    МНОГО = 1 << 50   # 1 ПиБ
+
+    def __enter__(self):
+        import gui
+
+        self.gui, self.было = gui, gui.shutil
+        много = self.МНОГО
+
+        class Диск:
+            @staticmethod
+            def disk_usage(path):
+                настоящее = shutil.disk_usage(path)   # существование папки не подменяем
+                return type("U", (), {"total": настоящее.total, "used": настоящее.used,
+                                      "free": много})()
+
+        gui.shutil = Диск
+        return self
+
+    def __exit__(self, *_):
+        self.gui.shutil = self.было
+
+
 class ОкноНаВремя:
-    """Окно плюс подмена диалогов и COMFYUI_ROOT, всё возвращается на место."""
+    """Окно плюс подмена диалогов, COMFYUI_ROOT и свободного места на диске."""
 
     def __init__(self, root, **диалоги):
         self.root = root
         self.диалоги = Диалоги(**диалоги)
+        self.место = МногоМеста()
 
     def __enter__(self):
         self.было_root = os.environ.get("COMFYUI_ROOT")
         self.диалоги.__enter__()
+        self.место.__enter__()
         self.app = qt_окно(self.root)
         return self.app, self.диалоги
 
@@ -1805,6 +1847,7 @@ class ОкноНаВремя:
         try:
             закрыть_окно(self.app)
         finally:
+            self.место.__exit__()
             self.диалоги.__exit__()
             if self.было_root is None:
                 os.environ.pop("COMFYUI_ROOT", None)
@@ -2006,6 +2049,35 @@ def the_window_closes_quietly_without_a_download():
         app.close()
         assert диалоги.показано == [], f"закрытие без закачки не должно ничего спрашивать: {диалоги.показано}"
         assert app.closing and not app.pump.isActive()
+
+
+@case
+def the_window_refuses_to_start_when_the_disk_is_full():
+    """Нехватка места в окне: вопроса «Начинаем?» нет, потока нет, диалог один.
+
+    Проверка появилась вместе с подменой свободного места в ОкноНаВремя: место
+    стало выдуманным, и без этой проверки настоящая ветка «Мало места» в окне
+    осталась бы не покрытой вовсе. У консоли своя такая же, с нулём места.
+    """
+    root = TMP / "gui-full-disk"
+    root.mkdir(exist_ok=True)
+    with ОкноНаВремя(root, ответ=True) as (app, диалоги):
+        class Полный:
+            @staticmethod
+            def disk_usage(path):
+                return type("U", (), {"total": 0, "used": 0, "free": 0})()
+
+        было = gui_модуль().shutil
+        gui_модуль().shutil = Полный
+        try:
+            app.select(True)
+            диалоги.показано.clear()
+            app.start()
+        finally:
+            gui_модуль().shutil = было
+
+    assert [(в, з) for в, з, _ in диалоги.показано] == [("ошибка", "Мало места")], диалоги.показано
+    assert app.worker is None, "ушёл качать на полный диск"
 
 
 @case

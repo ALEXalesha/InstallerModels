@@ -26,6 +26,10 @@ NSH = "version.nsh"
 # папки не было ни разу: у человека, который поставил программу установщиком,
 # половина ссылок в README вела в пустоту, а картинки не открывались вовсе.
 DOCS = "docs"
+# Оба README: английский на витрине GitHub, русский - тот, по которому программой
+# пользуются. Рядом с exe нужен прежде всего русский, но кладём оба: ссылки между
+# ними внутри поставки тоже должны вести не в пустоту.
+READMES = ("README.md", "README.ru.md")
 
 NSIS_CANDIDATES = [
     Path(r"C:\Program Files (x86)\NSIS\makensis.exe"),
@@ -209,21 +213,25 @@ def check_manifest():
 def check_docs():
     """README едет рядом с exe и ссылается на docs/. Ссылка в никуда в самом
     видном файле поставки - это не мелочь: собранную программу читают именно
-    по нему, а поправить его после сборки уже нельзя, только пересобрать."""
-    readme = (HERE / "README.md").read_text(encoding="utf-8")
-    missing = sorted({
-        link for link in re.findall(r"\(({}/[^)]+)\)".format(DOCS), readme)
-        if not (HERE / link).exists()
-    })
-    if missing:
-        sys.exit("README ссылается на то, чего нет: " + ", ".join(missing))
+    по нему, а поправить его после сборки уже нельзя, только пересобрать.
+
+    Проверяются оба: README.md английский, README.ru.md русский, и рядом с exe
+    кладутся тоже оба."""
+    for name in READMES:
+        readme = (HERE / name).read_text(encoding="utf-8")
+        missing = sorted({
+            link for link in re.findall(r"\(({}/[^)]+)\)".format(DOCS), readme)
+            if not (HERE / link).exists()
+        })
+        if missing:
+            sys.exit(f"{name} ссылается на то, чего нет: " + ", ".join(missing))
 
 
 def preflight():
     """Все проверки - до сборки. Раньше кодировка setup.nsi проверялась после
     двух прогонов PyInstaller, то есть через пару минут работы впустую."""
     for name in ("gui.py", "core.py", "tests.py", "tests_matrix.py", "models.json",
-                 "icon.ico", "setup.nsi", "README.md", DOCS):
+                 "icon.ico", "setup.nsi", *READMES, DOCS):
         if not (HERE / name).exists():
             sys.exit(f"не хватает файла {name}")
     check_docs()
@@ -250,7 +258,7 @@ def lay_out_extras(where):
     и показывает оттуда два скриншота. Установщик кладёт всю папку целиком,
     так что в собранной программе README теперь читается как в репозитории.
     """
-    for name in ("models.json", "README.md"):
+    for name in ("models.json", *READMES):
         shutil.copy2(HERE / name, where / name)
     shutil.copytree(HERE / DOCS, where / DOCS, dirs_exist_ok=True)
 

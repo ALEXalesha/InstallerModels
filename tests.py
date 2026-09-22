@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Проверки на всё, что уже ломалось. Запуск: python tests.py
+r"""Проверки на всё, что уже ломалось. Запуск: python tests.py
 
 Запускать из .venv проекта: .venv\Scripts\python.exe tests.py. Из сторонних
 библиотек нужен только PySide6 - для проверок окна; build.ps1 ставит его в .venv
@@ -597,13 +597,27 @@ def the_readme_links_to_docs_that_exist():
     """README едет рядом с exe и ссылается на docs/. Раньше туда клался он один,
     без docs/, и у человека с установленной программой половина ссылок вела в
     пустоту, а скриншоты не открывались. Теперь папку кладёт build.py - и здесь
-    же проверяется, что класть есть что."""
+    же проверяется, что класть есть что.
+
+    Обоих README это касается одинаково: английский на витрине GitHub и русский,
+    по которому программой пользуются, кладутся рядом с exe вместе."""
     import re
-    readme = (HERE / "README.md").read_text(encoding="utf-8")
-    links = re.findall(r"\((docs/[^)]+)\)", readme)
-    assert links, "в README не осталось ссылок на docs/ - проверка потеряла смысл"
-    missing = [link for link in links if not (HERE / link).exists()]
-    assert not missing, f"README ссылается на то, чего нет: {missing}"
+    for name in ("README.md", "README.ru.md"):
+        readme = (HERE / name).read_text(encoding="utf-8")
+        links = re.findall(r"\((docs/[^)]+)\)", readme) + re.findall(r'src="(docs/[^"]+)"', readme)
+        assert links, f"в {name} не осталось ссылок на docs/ - проверка потеряла смысл"
+        missing = [link for link in links if not (HERE / link).exists()]
+        assert not missing, f"{name} ссылается на то, чего нет: {missing}"
+
+
+@case
+def each_readme_points_at_the_other():
+    """Две страницы одного текста расходятся молча: одну переименовали, вторая
+    ссылается в пустоту, и человек с английской страницы просто не находит
+    русскую. Ссылка друг на друга проверяется, раз уж файлов стало два."""
+    for name, other in (("README.md", "README.ru.md"), ("README.ru.md", "README.md")):
+        readme = (HERE / name).read_text(encoding="utf-8")
+        assert f"({other})" in readme, f"{name} не ссылается на {other}"
 
 
 ХЕШ = {"a.bin": "a" * 64, "sub/b.bin": "b" * 64, "m.gguf": "c" * 64}

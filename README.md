@@ -2,7 +2,7 @@
 
 # InstallerModels
 
-**Puts ComfyUI models back on the disk after you deleted them to free space. Downloads straight from Hugging Face, resumes after a broken connection, checks the size and the sha256 - 15 files, 95.4 GiB, grouped by the workflow that needs them.**
+**Puts ComfyUI models back on the disk after you deleted them to free space. Downloads straight from Hugging Face, resumes after a broken connection, checks the size and the sha256 - 15 files, 95.4 GiB, grouped by the workflow that needs them. Your own models are added by pasting a link: the size, the hash and the settings are asked of Hugging Face, not of you.**
 
 [Download for Windows](https://github.com/ALEXalesha/InstallerModels/releases/latest) &nbsp;·&nbsp; [Русская версия этого файла](README.ru.md)
 
@@ -28,6 +28,7 @@ Models for LM Studio are **not** downloaded: files put into a folder behind LM S
 | Resume | the partial file lives next to the real one as `.part` and is never deleted, so the next run continues from the same byte |
 | Integrity | the size is checked against the response header before a single byte lands, and again after the download; the sha256 is computed while the bytes flow and verified before the file takes its final name |
 | No dependencies | the console version is bare standard library, Python 3.8+; the window adds PySide6 |
+| Your own models | paste a Hugging Face link, in the window or with `--add`: the exact size and sha256 come from the repository listing |
 | Windows builds | installer and portable, both carrying Python inside |
 
 <img src="docs/screen-lmstudio.png" width="820" alt="The LM Studio tab">
@@ -42,6 +43,8 @@ python install.py --check ltx       # per-file state: whole, partial, corrupt, m
 python install.py --verify          # recompute sha256 of what is on the disk
 python install.py --remove ltx --yes
 python install.py --sync-manifest --write   # refresh sizes and hashes from Hugging Face
+python install.py --add "https://huggingface.co/owner/repo/blob/main/file.safetensors"
+python install.py --add "https://huggingface.co/lmstudio-community/Some-GGUF" --lmstudio
 python install.py --all --root "D:/ComfyUI"
 ```
 
@@ -61,6 +64,24 @@ Every rule below was written after the matching failure actually happened. The [
 - **`Accept-Encoding: identity` is sent on purpose.** If a proxy compresses the response, `Content-Length` becomes the size of the archive, and a `Range` resume would seek into the wrong offsets.
 - **A full disk is reported as a full disk**, not retried as a network failure. Free space is checked up front for the whole queue, minus what already lies in `.part`.
 - **`dest` is validated when the manifest is read.** `Path("C:/ComfyUI") / "C:/qwe.bin"` is just `C:/qwe.bin` in Python - one typo and a 30 GiB file goes somewhere else entirely. Absolute paths, `..`, and the Windows device names (`CON`, `NUL`, `COM1`…) plus trailing spaces and dots are rejected outright: those are the names Windows accepts and then stores differently, so the file downloads again on every run, with no error and no file.
+
+## Adding your own model (2.1)
+
+The list ships the models one person's workflows need; anyone else needs different ones. That used to mean editing `models.json` by hand, including finding the exact size **in bytes** - and a four-byte mistake stops the download with "manifest is out of date", sending you to fix the very number you had just typed.
+
+Now it takes a link. There is a field under the group list in the window, and `--add` in the console:
+
+```bash
+python install.py --add "https://huggingface.co/owner/repo/blob/main/model.safetensors"
+```
+
+The program asks Hugging Face for the repository listing - the same one `--sync-manifest` uses - and takes the exact size and sha256 from it. The new entry is then checked exactly like the fifteen that shipped with it.
+
+- **Any shape of link works**: `/resolve/`, `/blob/`, `/raw/`, with `?download=true`, percent-encoded, without `https://`, or the short `owner/repo/path`. Only the `main` branch is accepted, because that is the only one the downloader can fetch - promising otherwise would be a lie.
+- **The folder inside ComfyUI is a guess, and is labelled as one**: `split_files/text_encoders/...` goes to `models/text_encoders`, a `.gguf` to `models/unet` (in ComfyUI that is a quantised unet for the GGUF nodes, not a checkpoint), a name containing `lora` to `models/loras`. Override it with `--dest models/loras/mine.safetensors --group mine`.
+- **A failure changes nothing.** Repository missing, file not in it, connection lost, name Windows cannot store - the manifest stays byte-for-byte as it was. Half an entry is worse than none: the next run reads the manifest whole and stops on the broken line.
+
+**LM Studio models work the same way, except the program works the settings out itself.** All you know is the repository address, so it reads the files and their exact sizes from the listing, takes the quant from the chosen file name (preferring `Q4_K_M`), picks up the `mmproj` companion by name - without it the model stops accepting images - and derives the `lms load` key from `base_model` in the repository card: `google/gemma-4-E2B-it` gives `google/gemma-4-e2b`. Whatever was guessed rather than read is listed as a guess in the report.
 
 ## Tests
 
@@ -89,9 +110,9 @@ Creates the project's own `.venv`, installs the dependencies, runs every check, 
 
 The title, the program name and the version are written down exactly once, in `core.py`; `build.py` generates `version.nsh` from them for NSIS. A check of the form "A equals B" is a symptom - the same fact is recorded twice. Keeping copies in sync never gets cheaper than not having copies.
 
-## Adding a model
+## Editing the manifest by hand
 
-`models.json` is the whole truth; the program guesses nothing.
+Hand-editing still works, and the program still guesses nothing - `models.json` is the whole truth. It is just no longer the only way in; see "Adding your own model" above.
 
 ```json
 {

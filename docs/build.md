@@ -7,6 +7,7 @@
 | Python 3.8+ (для сборки 3.13) | сам код | `py -3 --version` |
 | PySide6 | окно (Qt) | ставит `build.ps1` в `.venv` |
 | PyInstaller | превращает скрипт в exe | ставит `build.ps1` в `.venv` |
+| hypothesis | свойства в `tests_props.py` | ставит `build.ps1` в `.venv` |
 | NSIS 3 | собирает установщик | `"C:\Program Files (x86)\NSIS\makensis.exe" /VERSION` |
 | Pillow | только чтобы перерисовать иконку | `python -c "import PIL"` |
 
@@ -36,8 +37,8 @@ Portable: та же папка в zip, `InstallerModels-portable-<версия>.
 
 ```
 dist/app/InstallerModels/                    64.5 МБ
-dist/InstallerModels-portable-2.0.0.zip      26.3 МБ
-dist/InstallerModels-Setup-2.0.0.exe         19.1 МБ
+dist/InstallerModels-portable-2.1.0.zip      26.3 МБ
+dist/InstallerModels-Setup-2.1.0.exe         19.1 МБ
 ```
 
 На tkinter (до 2.0) было 26 МБ папки и 8.6 МБ установщика. Разница - это сам Qt, и это цена окна, которое не тормозит.
@@ -153,7 +154,7 @@ Portable-архив распаковывается, программа запу�
 Тихая установка и удаление для быстрой проверки:
 
 ```bash
-dist\InstallerModels-Setup-2.0.0.exe /S
+dist\InstallerModels-Setup-2.1.0.exe /S
 ```
 
 ```bash

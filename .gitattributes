@@ -1,0 +1,2 @@
+# Скрипты .sh всегда с LF: с CRLF Git Bash их просто не выполняет.
+*.sh text eol=lf

@@ -8,6 +8,8 @@ import sys
 
 from core import (
     Cancelled,
+    add_lmstudio,
+    add_model,
     apply_drift,
     check_manifest,
     comfy_root,
@@ -190,6 +192,57 @@ def cmd_sync(manifest, path, write):
     if gone:
         print("пути, которых больше нет, не тронуты - их надо править руками")
         return 1
+    return 0
+
+
+def cmd_add(manifest, path, link, group=None, dest=None, lmstudio=False, dry_run=False):
+    """Добавляет свою модель в models.json по ссылке на Hugging Face.
+
+    До этой команды свой файл добавлялся только правкой models.json руками, и
+    руками же приходилось добывать точный размер в байтах: ошибся на четыре
+    байта - и скачивание останавливается на «manifest is out of date». Размер и
+    контрольную сумму программа и так умела спрашивать у сервера (--sync-manifest),
+    не умела она только одного: принять ссылку.
+
+    Всё выведенное догадкой - папка внутри ComfyUI, выбранный квант, спутник
+    mmproj, ключ для «lms load» - печатается до записи и помечено словом
+    «догадка»: угадывать молча в файле, который потом читает программа, нельзя.
+    """
+    try:
+        if lmstudio:
+            added = add_lmstudio(manifest, link)
+            print(f"модель   {added.search}")
+            print(f"квант    {added.quant}")
+            if added.key:
+                print(f"ключ     {added.key}  (для lms load)")
+            for name in added.files:
+                print(f"файл     {name}")
+            print(f"объём    {human(added.total)}")
+        else:
+            added = add_model(manifest, link, group=group, dest=dest)
+            print(f"файл     {added.repo}/{added.path}")
+            print(f"кладу в  {added.dest}")
+            print(f"объём    {human(added.size)}")
+            print(f"sha256   {added.sha256 or 'сервер её не назвал - сверять будем по размеру'}")
+            print(f"группа   {added.group}{' (создана)' if added.new_group else ''}")
+    except ValueError as err:
+        print(f"не добавил: {err}")
+        return 1
+    except RuntimeError as err:          # сеть и ответы Hugging Face
+        print(f"не добавил: {err}")
+        return 1
+
+    догадки = (tuple(added.guessed) if lmstudio
+               else ("папка внутри ComfyUI",) if added.guessed
+               else ())
+    if догадки:
+        print("догадка: " + ", ".join(догадки) + " - проверь и поправь, если не так")
+
+    if dry_run:
+        print("\n--dry-run: в models.json ничего не записано")
+        return 0
+    save_manifest(manifest, path)
+    print(f"\nзаписано в {path}")
     return 0
 
 
@@ -408,15 +461,34 @@ def main():
                         help="check sizes in models.json against Hugging Face")
     parser.add_argument("--write", action="store_true",
                         help="with --sync-manifest: write the new sizes into models.json")
+    parser.add_argument("--add", metavar="LINK",
+                        help="add your own model to models.json by a Hugging Face link")
+    parser.add_argument("--group", metavar="NAME",
+                        help="with --add: which group to put it in (default: custom)")
+    parser.add_argument("--dest", metavar="PATH",
+                        help="with --add: where inside ComfyUI to put the file "
+                             "(default: guessed from the path in the repo)")
     parser.add_argument("--dry-run", action="store_true", help="show what would download")
     parser.add_argument("--root",
                         help="ComfyUI folder (beats COMFYUI_ROOT, the remembered "
                              "folder and models.json)")
     args = parser.parse_args()
 
+    # Добавление смотрит в сеть и в сам манифест: папка ComfyUI ему не нужна,
+    # как и сверке. Разбирается оно до --lmstudio, потому что «--add ... --lmstudio»
+    # это «добавь в раздел LM Studio», а не «покажи его список»: в обратном
+    # порядке команда молча печатала список и ничего не добавляла.
+    if args.add:
+        return cmd_add(manifest, manifest_path(), args.add, group=args.group,
+                       dest=args.dest, lmstudio=args.lmstudio, dry_run=args.dry_run)
+
     if args.lmstudio:
         cmd_lmstudio(manifest)
         return 0
+    for имя, значение in (("--group", args.group), ("--dest", args.dest)):
+        if значение:
+            print(f"{имя} работает только вместе с --add")
+            return 1
 
     # Сверка смотрит только в сеть и в сам манифест: папка ComfyUI ей не нужна,
     # так что и не требуем её - чинить манифест можно и не имея моделей.

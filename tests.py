@@ -7,8 +7,10 @@ r"""Проверки на всё, что уже ломалось. Запуск: 
 велеть рвать соединение когда захочется.
 """
 
+import contextlib
 import gc
 import http.server
+import io
 import json
 import os
 import shutil
@@ -22,6 +24,7 @@ from pathlib import Path
 
 import core
 import tests_matrix
+import tests_props
 
 BODY = bytes(range(256)) * 400  # 102400 байт
 SIZE = len(BODY)
@@ -49,6 +52,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # кусками по 7000 байт, это 15 подходов.
     bound = 40
     tree = []      # что отдаёт опись репозитория: список записей или код ошибки
+    card = {}      # что отдаёт карточка репозитория: объект или код ошибки
     pages = None   # пара страниц, когда проверяем постраничную выдачу
     base = ""      # адрес самого макета, для ссылки на следующую страницу
 
@@ -58,6 +62,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         Handler.hits += 1
         Handler.seen = dict(self.headers)
+
+        # Карточка репозитория: api/models/РЕПО без /tree/. Из неё берут
+        # base_model, по которой выводится ключ модели для "lms load".
+        if self.path.startswith("/api/") and "/tree/" not in self.path:
+            self.send_card()
+            return
 
         # Опись репозитория для --sync-manifest. Отдаётся отдельной ручкой и
         # к скачиванию отношения не имеет, поэтому и разбирается до режимов.
@@ -114,6 +124,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self.wfile.write(BODY[start:])
 
+    def send_card(self):
+        """Изображает api/models/РЕПО. Что отдавать - в Handler.card."""
+        if isinstance(Handler.card, int):
+            self.reply(Handler.card)
+            return
+        body = json.dumps(Handler.card).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def send_listing(self):
         """Изображает api/models/РЕПО/tree/main. Что отдавать - в Handler.tree:
         либо список записей, либо код ошибки, либо две страницы для проверки
@@ -127,7 +149,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = json.dumps(page).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Link", f'<{Handler.base}/api/x?page=2>; rel="next"')
+            # Адрес следующей страницы такой же, как у настоящего Hugging Face:
+            # api/models/РЕПО/tree/main. По «/tree/» макет и отличает опись от
+            # карточки, и ссылка мимо этого вида увела бы вторую страницу в карточку.
+            self.send_header("Link",
+                             f'<{Handler.base}/api/models/x/tree/main?page=2>; rel="next"')
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -620,7 +646,8 @@ def each_readme_points_at_the_other():
         assert f"({other})" in readme, f"{name} не ссылается на {other}"
 
 
-ХЕШ = {"a.bin": "a" * 64, "sub/b.bin": "b" * 64, "m.gguf": "c" * 64}
+ХЕШ = {"a.bin": "a" * 64, "sub/b.bin": "b" * 64, "m.gguf": "c" * 64,
+       "m-Q4_K_M.gguf": "d" * 64, "mmproj-m-F16.gguf": "e" * 64}
 
 
 def как_на_сервере(*files, lfs=True):
@@ -818,7 +845,7 @@ def one_source_for_the_name_version_and_title():
     import build
 
     исходники = ["core.py", "gui.py", "install.py", "build.py", "tests.py",
-                 "tests_matrix.py", "setup.nsi"]
+                 "tests_matrix.py", "tests_props.py", "setup.nsi"]
     for name in исходники:
         text = (HERE / name).read_text(encoding="utf-8-sig")
         # Заголовок окна core.py собирает из APP, так что целиком строка не
@@ -2470,12 +2497,466 @@ def the_installer_script_holds_together():
         "деинсталлятор не стирает запомненную папку ComfyUI"
 
 
+# ------------------------------------------- свои модели по ссылке на Hugging Face
+
+@contextlib.contextmanager
+def перехват():
+    """Печать команды - часть её поведения: по ней человек и узнаёт, что
+    записалось в манифест и что при этом было угадано."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        yield out
+
+
+@case
+def a_link_is_read_in_every_shape_it_is_copied():
+    """Ссылку копируют из пяти разных мест, и все пять обязаны работать.
+
+    Из адресной строки она приезжает с /blob/, из кнопки download - с /resolve/
+    и хвостом ?download=true, из поиска - вообще коротким «автор/репозиторий».
+    Отказ на любом из этих видов человек прочитает как «программа не понимает
+    Hugging Face», а не как «не тот вид ссылки».
+    """
+    ждём = ("Comfy-Org/Qwen-Image_ComfyUI", "split_files/vae/qwen_image_vae.safetensors")
+    for ссылка in (
+        "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors",
+        "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/blob/main/split_files/vae/qwen_image_vae.safetensors",
+        "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors?download=true",
+        "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files%2Fvae%2Fqwen_image_vae.safetensors",
+        "  huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/blob/main/split_files/vae/qwen_image_vae.safetensors  ",
+        "Comfy-Org/Qwen-Image_ComfyUI/split_files/vae/qwen_image_vae.safetensors",
+        '"https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/raw/main/split_files/vae/qwen_image_vae.safetensors"',
+    ):
+        ref = core.parse_hf_ref(ссылка)
+        assert (ref.repo, ref.path) == ждём, (ссылка, ref)
+
+
+@case
+def a_link_that_cannot_be_downloaded_is_refused_with_a_reason():
+    """У каждого отказа своя причина, и она должна быть названа.
+
+    «Не похоже на ссылку» на ссылку с чужой веткой - это отказ не по делу:
+    ссылка правильная, просто программа качает только main, и сказать надо
+    именно это.
+    """
+    for ссылка, слово in (
+        ("https://huggingface.co/a/b/resolve/dev/f.safetensors", "main"),
+        ("https://huggingface.co/a/b", "нет файла"),
+        ("https://huggingface.co/a/b/tree/main/split_files", "нет файла"),
+        ("https://huggingface.co/datasets/a/b/resolve/main/f.bin", "datasets"),
+        ("", "пустая"),
+        ("просто текст", "не похоже"),
+        ("https://example.com/a/b/resolve/main/f.bin", "не на Hugging Face"),
+    ):
+        try:
+            core.parse_hf_ref(ссылка)
+        except ValueError as err:
+            assert слово in str(err), f"{ссылка!r}: ждали про {слово!r}, а сказано {err}"
+        else:
+            raise AssertionError(f"{ссылка!r} принята, а качать по ней нечего")
+
+
+@case
+def the_folder_inside_comfyui_is_guessed_from_the_repo_layout():
+    """Папку внутри ComfyUI программа угадывает по тому, как автор разложил файлы.
+
+    Угадывание тут дешевле спроса: в репозиториях уже лежит
+    split_files/text_encoders/..., и попасть пальцем в небо трудно. А gguf в
+    ComfyUI - это квантованный unet для GGUF-нод, а не чекпойнт, и класть его в
+    checkpoints значит, что воркфлоу его не найдёт.
+    """
+    for path, ждём in (
+        ("split_files/vae/qwen_image_vae.safetensors", "models/vae/qwen_image_vae.safetensors"),
+        ("split_files/text_encoders/umt5.safetensors", "models/text_encoders/umt5.safetensors"),
+        ("Qwen-Image-Edit-2509-Q5_K_M.gguf", "models/unet/Qwen-Image-Edit-2509-Q5_K_M.gguf"),
+        ("some_lora_rank64.safetensors", "models/loras/some_lora_rank64.safetensors"),
+        ("CLIP-ViT-H-14-laion2B.safetensors", "models/clip_vision/CLIP-ViT-H-14-laion2B.safetensors"),
+        ("sdxl_vae.safetensors", "models/vae/sdxl_vae.safetensors"),
+        ("Juggernaut-XI-byRunDiffusion.safetensors",
+         "models/checkpoints/Juggernaut-XI-byRunDiffusion.safetensors"),
+    ):
+        assert core.suggest_dest(path) == ждём, (path, core.suggest_dest(path))
+
+
+@case
+def adding_a_model_takes_the_size_and_the_hash_from_the_server():
+    """Размер и контрольную сумму человек не вводит - их спрашивают у сервера.
+
+    Ровно из-за этого команда и появилась: руками добывался точный размер в
+    байтах, и ошибка на четыре байта останавливает скачивание сообщением про
+    устаревший манифест - то есть чинить человека отправляли в файл, который он
+    же только что и заполнил.
+    """
+    import copy
+
+    Handler.tree = как_на_сервере(("a.bin", 100), ("sub/b.bin", 200))
+    manifest = copy.deepcopy(SYNC_MANIFEST)
+    added = core.add_model(manifest, "автор/репо/sub/b.bin".replace("автор/репо", "owner/repo"))
+
+    assert added.size == 200, added
+    assert added.sha256 == ХЕШ["sub/b.bin"], added
+    assert added.group == core.CUSTOM_GROUP and added.new_group
+    запись = manifest["groups"][added.group]["files"][-1]
+    assert запись == {"dest": added.dest, "repo": "owner/repo", "path": "sub/b.bin",
+                      "size": 200, "sha256": ХЕШ["sub/b.bin"]}, запись
+    core.check_manifest(manifest)
+
+    # Вторая своя модель ложится в ту же группу, а не создаёт ещё одну.
+    ещё = core.add_model(manifest, "owner/repo/a.bin")
+    assert not ещё.new_group and len(manifest["groups"][core.CUSTOM_GROUP]["files"]) == 2
+
+
+@case
+def adding_a_model_without_a_hash_still_works():
+    """Не у всякого файла на сервере есть sha256: у мелких файлов вне LFS её нет
+    и взять неоткуда. Запись без суммы работает как раньше - сверка по размеру."""
+    import copy
+
+    Handler.tree = как_на_сервере(("a.bin", 100), lfs=False)
+    manifest = copy.deepcopy(SYNC_MANIFEST)
+    added = core.add_model(manifest, "owner/repo/a.bin")
+    assert added.sha256 is None
+    assert "sha256" not in manifest["groups"][added.group]["files"][-1]
+    core.check_manifest(manifest)
+
+
+@case
+def a_missing_file_names_the_file_and_not_the_repository():
+    """Файла нет в репозитории - значит опечатка в пути, а не беда с сетью.
+
+    Если в репозитории лежит файл с тем же именем, но в другой папке, он и
+    называется: это самая частая опечатка - взяли ссылку на страницу файла в
+    корне, а лежит он в split_files.
+    """
+    import copy
+
+    Handler.tree = как_на_сервере(("sub/b.bin", 200))
+    manifest = copy.deepcopy(SYNC_MANIFEST)
+    try:
+        core.add_model(manifest, "owner/repo/b.bin")
+    except ValueError as err:
+        assert "нет файла b.bin" in str(err), err
+        assert "sub/b.bin" in str(err), f"похожий путь не подсказан: {err}"
+    else:
+        raise AssertionError("файл, которого нет на сервере, попал в манифест")
+
+
+@case
+def a_closed_repository_asks_for_the_token_when_adding():
+    """401 и 403 при добавлении - это про лицензию и токен, а не про ссылку.
+
+    Отдельная проверка, потому что путь сюда другой: у скачивания свой разбор
+    кодов, а добавление идёт через опись репозитория.
+    """
+    import copy
+
+    for code in (401, 403):
+        Handler.tree = code
+        manifest = copy.deepcopy(SYNC_MANIFEST)
+        было = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
+        try:
+            core.add_model(manifest, "owner/repo/a.bin")
+        except RuntimeError as err:
+            assert "HF_TOKEN" in str(err), err
+        else:
+            raise AssertionError(f"{code} прошёл как удачное добавление")
+        assert json.dumps(manifest, ensure_ascii=False, sort_keys=True) == было
+
+
+@case
+def the_same_file_is_never_added_twice():
+    """Один и тот же dest в двух группах - это файл, который качается один раз,
+    по первой записи, и вторая группа навсегда остаётся «частично». Проверка
+    манифеста такое ловит, но сказать об этом надо до записи, а не после."""
+    import copy
+
+    Handler.tree = как_на_сервере(("a.bin", 100))
+    manifest = copy.deepcopy(SYNC_MANIFEST)
+    core.add_model(manifest, "owner/repo/a.bin")
+    слепок = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
+
+    for ссылка in ("owner/repo/a.bin",
+                   "https://huggingface.co/owner/repo/resolve/main/a.bin"):
+        try:
+            core.add_model(manifest, ссылка)
+        except ValueError as err:
+            assert "уже" in str(err), err
+        else:
+            raise AssertionError(f"{ссылка} добавилась второй раз")
+    assert json.dumps(manifest, ensure_ascii=False, sort_keys=True) == слепок
+
+
+@case
+def an_lmstudio_model_learns_its_own_settings():
+    """Настройки модели для LM Studio программа выясняет сама.
+
+    Человеку известен только адрес репозитория. Какой там квант, какие файлы,
+    сколько они весят и каким ключом модель зовут из «lms load» - всё это
+    лежит в описи и карточке репозитория, и спрашивать это у человека значит
+    заставить его переписывать в манифест то, что сервер и так отдаёт.
+    """
+    import copy
+
+    Handler.tree = как_на_сервере(("m-Q4_K_M.gguf", 300), ("mmproj-m-F16.gguf", 90))
+    Handler.card = {"cardData": {"base_model": "Google/Gemma-4-E2B-it"}}
+    manifest = copy.deepcopy(SYNC_MANIFEST)
+    added = core.add_lmstudio(manifest, "https://huggingface.co/lmstudio-community/m-GGUF")
+
+    assert added.search == "lmstudio-community/m-GGUF"
+    assert added.quant == "Q4_K_M", added.quant   # из имени m-Q4_K_M.gguf в описи
+    assert added.key == "google/gemma-4-e2b", added.key
+    assert added.total == 390, "спутник mmproj не учтён в объёме"
+    модель = manifest["lmstudio"][-1]
+    assert модель["files"] == [
+        {"name": "m-Q4_K_M.gguf", "size": 300, "sha256": ХЕШ["m-Q4_K_M.gguf"]},
+        {"name": "mmproj-m-F16.gguf", "size": 90, "sha256": ХЕШ["mmproj-m-F16.gguf"]},
+    ], модель
+    assert set(added.guessed) >= {"файл", "mmproj", "ключ"}, added.guessed
+    core.check_manifest(manifest)
+
+
+@case
+def an_lmstudio_repo_without_gguf_is_refused():
+    """LM Studio читает GGUF. Репозиторий с safetensors ей не подходит, и
+    сказать об этом надо сразу, а не записать модель, которую не открыть."""
+    import copy
+
+    Handler.tree = как_на_сервере(("a.bin", 100))
+    Handler.card = {}
+    manifest = copy.deepcopy(SYNC_MANIFEST)
+    было = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
+    try:
+        core.add_lmstudio(manifest, "lmstudio-community/m-GGUF")
+    except ValueError as err:
+        assert "gguf" in str(err).lower(), err
+    else:
+        raise AssertionError("репозиторий без GGUF записан в раздел LM Studio")
+    assert json.dumps(manifest, ensure_ascii=False, sort_keys=True) == было
+
+
+@case
+def the_add_command_writes_the_manifest_only_when_it_worked():
+    """Команда --add целиком: от ссылки до записанного файла.
+
+    Отдельно от core, потому что тут проверяется то, чего в core нет: код
+    возврата, печать догадок и то, что при --dry-run файл на диске не меняется.
+    """
+    import copy
+
+    Handler.tree = как_на_сервере(("a.bin", 100), ("sub/b.bin", 200))
+    Handler.card = {}
+    import install
+
+    path = TMP / "add-models.json"
+    core.save_manifest(copy.deepcopy(SYNC_MANIFEST), path)
+    было = path.read_bytes()
+
+    with перехват() as out:
+        code = install.cmd_add(core.load_manifest(path), path,
+                               "https://huggingface.co/owner/repo/blob/main/sub/b.bin",
+                               dry_run=True)
+    assert code == 0, out.getvalue()
+    assert "догадка" in out.getvalue(), out.getvalue()
+    assert path.read_bytes() == было, "--dry-run записал манифест"
+
+    with перехват() as out:
+        code = install.cmd_add(core.load_manifest(path), path, "owner/repo/sub/b.bin",
+                               dest="models/loras/своя.safetensors")
+    assert code == 0, out.getvalue()
+    assert "догадка" not in out.getvalue(), "названный руками dest догадкой не является"
+    записанный = core.load_manifest(path)          # читается обратно и проходит проверку
+    assert записанный["groups"][core.CUSTOM_GROUP]["files"][-1]["size"] == 200
+
+    # Тот же файл второй раз: код 1, объяснение, файл на диске не тронут.
+    было = path.read_bytes()
+    with перехват() as out:
+        code = install.cmd_add(записанный, path, "owner/repo/sub/b.bin")
+    assert code == 1 and "не добавил" in out.getvalue(), out.getvalue()
+    assert path.read_bytes() == было, "неудачное добавление переписало манифест"
+
+
+@case
+def the_add_command_reaches_the_lmstudio_section_too():
+    """--add --lmstudio кладёт модель в свой раздел, а не в группы ComfyUI."""
+    import copy
+
+    Handler.tree = как_на_сервере(("m-Q4_K_M.gguf", 300))
+    Handler.card = {"cardData": {"base_model": ["Qwen/Qwen3-VL-4B-Instruct"]}}
+    import install
+
+    path = TMP / "add-lmstudio.json"
+    core.save_manifest(copy.deepcopy(SYNC_MANIFEST), path)
+
+    with перехват() as out:
+        code = install.cmd_add(core.load_manifest(path), path,
+                               "lmstudio-community/m-GGUF", lmstudio=True)
+    assert code == 0, out.getvalue()
+    assert "qwen/qwen3-vl-4b" in out.getvalue(), out.getvalue()
+    записанный = core.load_manifest(path)
+    assert записанный["lmstudio"][-1]["search"] == "lmstudio-community/m-GGUF"
+    assert len(записанный["groups"]) == len(SYNC_MANIFEST["groups"]), \
+        "модель LM Studio попала в группы ComfyUI"
+
+
+@case
+def the_window_adds_a_model_by_link():
+    """Окно целиком: ссылка в поле - и строка группы появилась.
+
+    Поток тут вызывается напрямую, без настоящего потока: проверяется не Qt, а
+    то, что ответ из потока доезжает до окна через ту же очередь событий, что и
+    прогресс закачки, и что список групп после этого пересобирается.
+    """
+    import copy
+
+    Handler.tree = как_на_сервере(("a.bin", 100))
+    Handler.card = {}
+    root = TMP / "gui-add"
+    root.mkdir(exist_ok=True)
+    манифест = TMP / "gui-add.json"
+    core.save_manifest(copy.deepcopy(SYNC_MANIFEST), манифест)
+
+    with ОкноНаВремя(root) as (app, диалоги):
+        app.manifest = core.load_manifest(манифест)
+        app.fill_groups()
+        было = len(app.rows)
+        # Куда писать манифест, окно знает через core.manifest_path; на время
+        # проверки подменяем его, чтобы не тронуть настоящий models.json.
+        было_path = gui_модуль().manifest_path
+        gui_модуль().manifest_path = lambda: манифест
+        try:
+            app.add_edits["comfy"].setText("https://huggingface.co/owner/repo/blob/main/a.bin")
+            app.adding = True
+            app.lock_adding(True)
+            app.run_add("comfy", app.add_edits["comfy"].text())
+            app.drain_events()
+        finally:
+            gui_модуль().manifest_path = было_path
+
+        assert len(app.rows) == было + 1, "строка своей группы в окне не появилась"
+        assert app.add_edits["comfy"].text() == "", "поле не очистилось после добавления"
+        assert not app.adding and app.add_buttons["comfy"].isEnabled()
+        assert [в for в, _, _ in диалоги.показано] == ["инфо"], диалоги.показано
+        окно_согласовано(app)
+
+    # И записалось на диск, и читается обратно.
+    assert core.load_manifest(манифест)["groups"][core.CUSTOM_GROUP]["files"][0]["size"] == 100
+
+
+@case
+def the_window_explains_a_bad_link_and_changes_nothing():
+    """Кривая ссылка - это диалог с объяснением, а не молчание и не трассировка.
+
+    И список групп после отказа обязан остаться прежним: половина добавленной
+    модели в окне была бы ещё хуже, чем в файле.
+    """
+    import copy
+
+    Handler.tree = как_на_сервере(("a.bin", 100))
+    root = TMP / "gui-add-bad"
+    root.mkdir(exist_ok=True)
+    with ОкноНаВремя(root) as (app, диалоги):
+        было = len(app.rows)
+        слепок = json.dumps(app.manifest, ensure_ascii=False, sort_keys=True)
+        app.adding = True
+        app.run_add("comfy", "просто текст")
+        app.drain_events()
+
+        assert [в for в, _, _ in диалоги.показано] == ["ошибка"], диалоги.показано
+        assert len(app.rows) == было
+        assert json.dumps(app.manifest, ensure_ascii=False, sort_keys=True) == слепок
+        assert not app.adding and app.add_buttons["comfy"].isEnabled()
+        окно_согласовано(app)
+
+
+@case
+def adding_is_locked_while_a_download_runs():
+    """Пока идёт закачка, добавлять нельзя: очередь в потоке собрана по старому
+    манифесту, и правка под ней означала бы, что окно показывает одно, а поток
+    качает другое."""
+    root = TMP / "gui-add-lock"
+    root.mkdir(exist_ok=True)
+    with ОкноНаВремя(root) as (app, диалоги):
+        app.lock_controls(True)
+        assert not any(b.isEnabled() for b in app.add_buttons.values())
+        app.add_edits["comfy"].setText("owner/repo/a.bin")
+        app.worker = type("Ж", (), {"is_alive": staticmethod(lambda: True)})()
+        try:
+            app.add_by_link("comfy")
+        finally:
+            app.worker = None
+        assert диалоги.показано == [], "добавление во время закачки о чём-то спросило"
+        app.lock_controls(False)
+        assert all(b.isEnabled() for b in app.add_buttons.values())
+
+
+@case
+def an_empty_link_asks_for_a_link_instead_of_going_to_the_network():
+    Handler.hits = 0
+    root = TMP / "gui-add-empty"
+    root.mkdir(exist_ok=True)
+    with ОкноНаВремя(root) as (app, диалоги):
+        app.add_edits["lmstudio"].setText("   ")
+        app.add_by_link("lmstudio")
+        assert [в for в, _, _ in диалоги.показано] == ["инфо"], диалоги.показано
+        assert Handler.hits == 0, "пустая ссылка ушла в сеть"
+        assert not app.adding
+
+
+@case
+def the_add_flag_wins_over_the_lmstudio_listing():
+    """«--add ССЫЛКА --lmstudio» - это «добавь в раздел LM Studio».
+
+    Разбор команды шёл в другом порядке, и такая команда молча печатала список
+    моделей, ничего не добавляя: человек видел осмысленный вывод и думал, что
+    добавилось. Проверяется сам разбор, без сети: команды подменены.
+    """
+    import install
+
+    звали = []
+    было = (install.cmd_add, install.cmd_lmstudio, sys.argv)
+    install.cmd_add = lambda *a, **k: звали.append(("add", k.get("lmstudio"))) or 0
+    install.cmd_lmstudio = lambda *a, **k: звали.append(("список", None))
+    try:
+        for argv, ждём in ((["--add", "a/b/c.bin"], ("add", False)),
+                           (["--add", "a/b", "--lmstudio"], ("add", True)),
+                           (["--lmstudio"], ("список", None))):
+            звали.clear()
+            sys.argv = ["install.py"] + argv
+            with перехват():
+                install.main()
+            assert звали == [ждём], f"{argv}: позвали {звали}, ждали {[ждём]}"
+    finally:
+        install.cmd_add, install.cmd_lmstudio, sys.argv = было
+
+
+@case
+def group_and_dest_without_add_are_refused():
+    """--group и --dest без --add ничего не значат. Молча проглоченный флаг
+    выглядит как сработавший: человек решит, что файл лёг в названную папку."""
+    import install
+
+    было = sys.argv
+    try:
+        for argv in (["--group", "своё"], ["--dest", "models/loras/x.safetensors"]):
+            sys.argv = ["install.py"] + argv
+            with перехват() as out:
+                code = install.main()
+            assert code == 1 and "только вместе с --add" in out.getvalue(), out.getvalue()
+    finally:
+        sys.argv = было
+
+
 # ------------------------------------------------------------------- прогон
 
 # Матрица лежит отдельно, потому что устроена наоборот: тут список поломок,
 # которые уже случались, там перебор пространства с проверкой инвариантов.
 # Регистрируем её теми же case(), чтобы прогон и отчёт остались одни на всех.
 for check in tests_matrix.CASES:
+    case(check)
+
+# Свойства добавления по ссылке: третий способ проверять - описать, каким вход
+# бывает вообще, и дать hypothesis искать тот, на котором правило ломается.
+for check in tests_props.CASES:
     case(check)
 
 HERE = Path(__file__).resolve().parent

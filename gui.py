@@ -6,6 +6,7 @@
 Qt рисует всё окно одним буфером.
 """
 
+import copy
 import queue
 import shutil
 import sys
@@ -40,6 +41,8 @@ from core import (
     Cancelled,
     QueueProgress,
     WINDOW_TITLE,
+    add_lmstudio,
+    add_model,
     app_dir,
     comfy_root,
     dest_path,
@@ -53,6 +56,7 @@ from core import (
     needed_bytes,
     part_path,
     pending,
+    save_manifest,
     remember_root,
     removable,
     remove_files,
@@ -176,6 +180,12 @@ class App(QMainWindow):
         self.worker = None
         self.closing = False
         self.rows = {}
+        # Поля «добавить свою модель» по одному на вкладку, и общий признак
+        # «запрос в сети уже идёт»: второе нажатие до ответа добавило бы модель
+        # дважды, а третье - трижды.
+        self.add_edits = {}
+        self.add_buttons = {}
+        self.adding = False
 
         # Заголовок ищет установщик через FindWindow, чтобы не сносить запущенную
         # программу. Строка одна на обоих: отсюда она же уезжает в version.nsh,
@@ -232,13 +242,10 @@ class App(QMainWindow):
         lay.addLayout(top)
 
         table = QGroupBox("Группы моделей")
-        grid = QGridLayout(table)
-        grid.setColumnStretch(0, 1)
-        grid.setHorizontalSpacing(16)
-        for n, (key, group) in enumerate(self.manifest["groups"].items()):
-            row = GroupRow(key, group, self.update_selection)
-            row.place(grid, n)
-            self.rows[key] = row
+        self.groups_grid = QGridLayout(table)
+        self.groups_grid.setColumnStretch(0, 1)
+        self.groups_grid.setHorizontalSpacing(16)
+        self.fill_groups()
         lay.addWidget(table)
 
         picks = QHBoxLayout()
@@ -259,6 +266,12 @@ class App(QMainWindow):
         self.picked_label.setFont(bold)
         picks.addWidget(self.picked_label)
         lay.addLayout(picks)
+
+        lay.addLayout(self.build_add_row(
+            "comfy",
+            "Своя модель: ссылка на файл в Hugging Face",
+            "https://huggingface.co/автор/репозиторий/resolve/main/файл.safetensors",
+        ))
 
         bars = QGridLayout()
         self.file_label = QLabel("готов к работе")
@@ -306,13 +319,128 @@ class App(QMainWindow):
         log_lay.addWidget(self.log_text)
         lay.addWidget(log_box, 1)
 
+    def fill_groups(self):
+        """Заново раскладывает строки групп. Зовётся и при сборке окна, и после
+        того, как человек добавил свою модель: список групп после этого другой."""
+        grid = self.groups_grid
+        while grid.count():
+            виджет = grid.takeAt(0).widget()
+            if виджет is not None:
+                виджет.setParent(None)
+                виджет.deleteLater()
+        self.rows = {}
+        for n, (key, group) in enumerate(self.manifest["groups"].items()):
+            row = GroupRow(key, group, self.update_selection)
+            row.place(grid, n)
+            self.rows[key] = row
+
+    def build_add_row(self, kind, label, placeholder):
+        """Поле «добавить свою модель по ссылке» - одинаковое на обеих вкладках.
+
+        Раньше свой файл добавлялся только правкой models.json руками, а точный
+        размер в байтах приходилось добывать самому: ошибка на четыре байта
+        останавливает скачивание сообщением про устаревший манифест. Размер и
+        контрольную сумму программа спрашивает у Hugging Face сама.
+        """
+        box = QVBoxLayout()
+        box.addWidget(QLabel(label))
+        line = QHBoxLayout()
+        edit = QLineEdit()
+        edit.setPlaceholderText(placeholder)
+        edit.returnPressed.connect(lambda k=kind: self.add_by_link(k))
+        button = QPushButton("Добавить")
+        button.clicked.connect(lambda _c=False, k=kind: self.add_by_link(k))
+        line.addWidget(edit, 1)
+        line.addWidget(button)
+        box.addLayout(line)
+        self.add_edits[kind] = edit
+        self.add_buttons[kind] = button
+        return box
+
+    def lock_adding(self, busy):
+        for button in self.add_buttons.values():
+            button.setEnabled(not busy)
+
+    def add_by_link(self, kind):
+        """Спрашивает у Hugging Face всё про файл по ссылке и дописывает в манифест.
+
+        Запрос уходит в поток: сеть отвечает не мгновенно, а замерший на десять
+        секунд интерфейс выглядит как зависшая программа. Ответ приезжает через
+        ту же очередь событий, что и прогресс закачки, - другого пути с потока
+        в окно тут нет и быть не должно.
+        """
+        if self.adding or self.running():
+            return
+        link = self.add_edits[kind].text().strip()
+        if not link:
+            dialogs.info(self, "Нужна ссылка",
+                         "Вставь ссылку на файл в Hugging Face - ту, что в адресной "
+                         "строке браузера или под кнопкой download.")
+            return
+        self.adding = True
+        self.lock_adding(True)
+        self.log(f"спрашиваю Hugging Face про {link}")
+        threading.Thread(target=self.run_add, args=(kind, link), daemon=True).start()
+
+    def run_add(self, kind, link):
+        """Поток: манифест правится на копии, и только удачная правка едет в окно."""
+        копия = copy.deepcopy(self.manifest)
+        try:
+            if kind == "lmstudio":
+                added = add_lmstudio(копия, link)
+            else:
+                added = add_model(копия, link)
+            save_manifest(копия, manifest_path())
+        except (ValueError, RuntimeError) as err:
+            self.events.put(("added", (kind, None, None, str(err))))
+        except OSError as err:
+            # Манифест лежит рядом с exe: в папке только для чтения запись не
+            # пройдёт, и сказать об этом надо про файл, а не про сеть.
+            self.events.put(("added", (kind, None, None,
+                                       f"не записалось в models.json: {err}")))
+        else:
+            self.events.put(("added", (kind, added, копия, None)))
+
+    def finish_add(self, kind, added, manifest, error):
+        """Ответ из потока. Манифест в окне меняется только здесь и только целиком:
+        в потоке правилась копия, и неудачная правка до окна не доезжает вовсе."""
+        self.adding = False
+        self.lock_adding(self.running())
+        if error:
+            self.log(f"не добавил: {error}")
+            dialogs.error(self, "Не добавил", error)
+            return
+        self.manifest = manifest
+        self.add_edits[kind].clear()
+        if kind == "lmstudio":
+            self.fill_lmstudio()
+            догадки = ", ".join(added.guessed)
+            строки = [added.search,
+                      f"квант {added.quant}, всего {size_ru(added.total)}",
+                      *added.files]
+            if added.key:
+                строки.append(f"ключ модели в LM Studio: {added.key}")
+        else:
+            self.fill_groups()
+            self.refresh()
+            догадки = "папка внутри ComfyUI" if added.guessed else ""
+            строки = [f"{added.repo}/{added.path}",
+                      f"кладу в {added.dest}",
+                      f"объём {size_ru(added.size)}",
+                      f"группа {added.group}" + (" (создана)" if added.new_group else "")]
+        текст = "\n".join(строки)
+        if догадки:
+            текст += f"\n\nдогадка: {догадки} - проверь и поправь в models.json, если не так"
+        self.log(f"добавлено: {строки[0]}")
+        dialogs.info(self, "Добавлено", текст)
+
     def build_lmstudio(self, page):
         outer = QVBoxLayout(page)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         inner = QWidget()
-        lay = QVBoxLayout(inner)
+        self.lmstudio_lay = QVBoxLayout(inner)
         scroll.setWidget(inner)
         outer.addWidget(scroll)
 
@@ -322,7 +450,28 @@ class App(QMainWindow):
             " в поиск внутри LM Studio."
         )
         intro.setWordWrap(True)
-        lay.addWidget(intro)
+        self.lmstudio_lay.addWidget(intro)
+        self.fill_lmstudio()
+
+        outer.addLayout(self.build_add_row(
+            "lmstudio",
+            "Своя модель: ссылка на GGUF-репозиторий в Hugging Face",
+            "https://huggingface.co/lmstudio-community/имя-GGUF",
+        ))
+
+    def fill_lmstudio(self):
+        """Заново раскладывает карточки моделей LM Studio.
+
+        Вступление наверху вкладки трогать нельзя - оно не про модели, поэтому
+        снимаются только виджеты после него.
+        """
+        lay = self.lmstudio_lay
+        while lay.count() > 1:
+            item = lay.takeAt(1)
+            виджет = item.widget()
+            if виджет is not None:
+                виджет.setParent(None)
+                виджет.deleteLater()
 
         self.copy_buttons = []
         for model in self.manifest.get("lmstudio", []):
@@ -365,6 +514,9 @@ class App(QMainWindow):
             widget.setEnabled(not running)
         for row in self.rows.values():
             row.box.setEnabled(not running)
+        # Добавление правит манифест, а очередь в потоке собрана по старому:
+        # пока качаем, добавлять нельзя.
+        self.lock_adding(running or self.adding)
 
     def copy(self, text):
         # Qt при выходе сам отдаёт буфер обмена системе (OleFlushClipboard), так
@@ -634,6 +786,8 @@ class App(QMainWindow):
                 )
             else:
                 self.speed_label.setText("")
+        elif kind == "added":
+            self.finish_add(*payload)
         elif kind == "done":
             self.finish_job(*payload)
 

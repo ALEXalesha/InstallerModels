@@ -2413,6 +2413,14 @@ URL = None
 
 def main():
     global URL
+    # Отчёт по-русски, а stdout в трубе берёт кодировку системы, а не консоли:
+    # на английской Windows это cp1252, и первая же строчка «ок» падает
+    # UnicodeEncodeError - не проверка сломалась, а печать о ней. Так и вышло на
+    # раннере GitHub, где вывод уходит в лог, а не на экран.
+    for поток in (sys.stdout, sys.stderr):
+        if hasattr(поток, "reconfigure"):
+            поток.reconfigure(encoding="utf-8", errors="replace")
+
     core.wait_before_retry = lambda seconds, should_stop: None  # не ждём по пять секунд
 
     # Настройки уводим в песочницу на весь прогон.

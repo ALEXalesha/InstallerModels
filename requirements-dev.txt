@@ -1,2 +1,4 @@
 -r requirements.txt
 pyinstaller>=6.10
+# Свойства добавления по ссылке (tests_props.py): гипотезы вместо примеров.
+hypothesis>=6.100

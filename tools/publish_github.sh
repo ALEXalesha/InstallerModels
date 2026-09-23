@@ -97,8 +97,10 @@ for ref in $(git for-each-ref --format='%(refname)' refs/github-tags); do
   old=$(git rev-parse "$ref^{commit}")
   git merge-base --is-ancestor "$old" github-main && continue
   key=$(git log -1 --format='%at %s' "$old")
+  # awk дочитывает вход до конца, без exit: при раннем выходе git log получал SIGPIPE,
+  # и с pipefail скрипт обрывался здесь молча (код 141) - так было с двумя репозиториями.
   new=$(git log github-main --format='%H %at %s' \
-        | awk -v k="$key" '{h=$1; $1=""; if (substr($0,2)==k) {print h; exit}}')
+        | awk -v k="$key" '{h=$1; $1=""; if (!f && substr($0,2)==k) {print h; f=1}}')
   if [ -z "$new" ]; then
     echo "тег $name: в публикуемой ветке нет коммита с тем же временем и заголовком - оставлен" >&2
     continue

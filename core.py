@@ -32,7 +32,7 @@ TIMEOUT = 60
 # заводить. NSIS читать Python не умеет, поэтому build.py кладёт ему эти же
 # три строки в version.nsh перед сборкой.
 APP = "InstallerModels"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 # Установщик ищет запущенную программу по заголовку окна через FindWindow.
 WINDOW_TITLE = f"{APP} - модели для ComfyUI"
 FROZEN = getattr(sys, "frozen", False)
@@ -247,21 +247,49 @@ def saved_root():
     окажется список, а не объект, то .get() падал прямо в __init__ окна - вместо
     забытой настройки человек получал окно с сообщением про нечитаемый models.json.
     """
-    try:
-        with open(settings_path(), encoding="utf-8") as fh:
-            value = json.load(fh).get("comfyui_root")
-    except (OSError, ValueError, AttributeError):
-        return None
+    value = read_settings().get("comfyui_root")
     return str(value) if isinstance(value, str) and value else None
 
 
-def remember_root(path):
+def read_settings():
+    """settings.json целиком; нет файла, мусор или не объект - пустой словарь."""
+    try:
+        with open(settings_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_setting(key, value):
+    """Один ключ settings.json, остальные на месте. Раньше remember_root писал файл
+    целиком из одного ключа, и с появлением второго (место окна, 2.2.0) «Обзор»
+    стирал бы его. Запись через временный файл: убитый посреди записи процесс
+    оставит прежний файл, а не половину нового."""
+    data = read_settings()
+    data[key] = value
     try:
         settings_path().parent.mkdir(parents=True, exist_ok=True)
-        with open(settings_path(), "w", encoding="utf-8") as fh:
-            json.dump({"comfyui_root": str(path)}, fh, ensure_ascii=False, indent=2)
+        tmp = settings_path().with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, settings_path())
     except OSError:
         pass  # не запомнили - не беда, работать это не мешает
+
+
+def remember_root(path):
+    write_setting("comfyui_root", str(path))
+
+
+def saved_window():
+    """Место и размер окна с прошлого раза (строка window_geometry) или None."""
+    value = read_settings().get("window")
+    return value if isinstance(value, str) and value else None
+
+
+def remember_window(text):
+    write_setting("window", text)
 
 
 # Приметы папки ComfyUI, снятые с настоящей установки, а не выдуманные.

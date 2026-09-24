@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import window_geometry
 from core import (
     Cancelled,
     QueueProgress,
@@ -58,6 +59,8 @@ from core import (
     pending,
     save_manifest,
     remember_root,
+    remember_window,
+    saved_window,
     removable,
     remove_files,
     status,
@@ -193,6 +196,8 @@ class App(QMainWindow):
         self.setWindowTitle(WINDOW_TITLE)
         self.resize(880, 720)
         self.setMinimumSize(720, 560)
+        # Окно открывается там и такого размера, где его закрыли (2.2.0).
+        window_geometry.restore(self, saved_window())
         self.build()
         # Папку, выбранную «Обзором», помним между запусками. Порядок источников
         # один на окно и на консоль и живёт в comfy_root().
@@ -847,6 +852,7 @@ class App(QMainWindow):
             # прямо на write(), и последние мегабайты буфера пропадали.
             self.worker.join(timeout=5)
         self.closing = True
+        remember_window(window_geometry.encode(self))
         self.pump.stop()
         event.accept()
 

@@ -1434,6 +1434,57 @@ def verify_catches_rot_that_size_cannot_see():
 
 
 @case
+def the_window_comes_back_where_and_how_large_it_was():
+    """Окно открывается там и такого размера, где его закрыли (2.2.0)."""
+    from PySide6.QtCore import QRect
+
+    root = TMP / "окно-comfy"
+    (root / "models").mkdir(parents=True, exist_ok=True)
+    with МногоМеста():
+        app = qt_окно(root)
+        # Экран самого окна, а не основной: скрытое окно (WA_DontShowOnScreen) не узнаёт,
+        # что его передвинули на другой монитор, и Qt при восстановлении вернул бы его на
+        # «свой». С двумя мониторами итог зависел от того, где стояла мышь.
+        area = app.screen().availableGeometry()
+        want = QRect(area.x() + 30, area.y() + 40, 900, 640)
+        app.setGeometry(want)
+        закрыть_окно(app)
+        assert core.saved_window(), "место окна не записалось"
+        again = qt_окно(root)
+        try:
+            got = (again.x(), again.y(), again.width(), again.height())
+            assert got == (want.x(), want.y(), 900, 640), got
+        finally:
+            закрыть_окно(again)
+
+
+@case
+def other_settings_survive_each_other():
+    """Настройки пишутся по ключу: «Обзор» не стирает место окна, окно - папку.
+    Раньше remember_root писал settings.json целиком из одного ключа."""
+    core.remember_window("abc=")
+    core.remember_root("D:/Сохранится")
+    assert core.saved_window() == "abc="
+    core.remember_window("xyz=")
+    assert core.saved_root() == "D:/Сохранится"
+    assert not core.settings_path().with_suffix(".json.tmp").exists()
+
+
+@case
+def a_broken_window_line_gives_the_default_size():
+    root = TMP / "окно-comfy"
+    (root / "models").mkdir(parents=True, exist_ok=True)
+    for bad in ["@@@", "AAAA", "aGVsbG8="]:
+        core.remember_window(bad)
+        with МногоМеста():
+            app = qt_окно(root)
+            try:
+                assert (app.width(), app.height()) == (880, 720), (bad, app.width(), app.height())
+            finally:
+                закрыть_окно(app)
+
+
+@case
 def the_checks_never_touch_the_real_settings():
     """Прогон обязан быть безвредным для машины, на которой идёт.
 

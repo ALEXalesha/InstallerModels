@@ -89,7 +89,7 @@ The program asks Hugging Face for the repository listing - the same one `--sync-
 .venv\Scripts\python.exe tests.py
 ```
 
-86 checks, about 16 seconds, no network: Hugging Face is played by a local server that can be told to drop the connection, report the wrong size or go quiet.
+89 checks, about 16 seconds, no network: Hugging Face is played by a local server that can be told to drop the connection, report the wrong size or go quiet.
 
 The three files are built on different principles, which is the point:
 
@@ -97,7 +97,7 @@ The three files are built on different principles, which is the point:
 - **`tests_matrix.py` knows no specific bug at all.** It walks 480 combinations of how the server can behave and what can be on the disk, and in every cell demands the same seven rules - "only a readable error comes out, never a Python traceback", "a wrong body never appears under the final name". Rules like that also catch what nobody foresaw. The same file walks 1884 queues for the window's progress bars and 264 ways to corrupt the manifest.
 - **`tests_props.py` does not even know the space.** It describes what an input can look like - a link, a repository listing, the state of the manifest - and hypothesis looks for the one that breaks a rule, then shrinks it to the shortest example. The first run found three real bugs: the quantisation was taken from the first match in the file name, not the last (`Qwen3-Q8-preview-Q4_K_M.gguf` would have been recorded as `Q8`); a file named like a Windows device was explained as a complaint about `models.json`, which the user had not touched; and `https://example.com/a/b/...` was parsed as the repository `example.com/a`.
 
-Behind seven of the 86 checks there are 6530 generated cases. The window is covered too: widget construction, the event pump, the three ways a download can end, 300 random actions in a row with the invariants checked after each one, the window-title lookup done exactly as the installer's `FindWindow` does it, and a resize speed budget.
+Behind seven of the 89 checks there are 6530 generated cases. The window is covered too: widget construction, the event pump, the three ways a download can end, 300 random actions in a row with the invariants checked after each one, the window-title lookup done exactly as the installer's `FindWindow` does it, and a resize speed budget.
 
 Details of the invariants, the axes of the sweep and the mutation run: [docs/tests.md](docs/tests.md).
 

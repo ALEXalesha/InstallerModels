@@ -1,0 +1,40 @@
+# Проверки на домашнем Gitea. Копия .github/workflows/ci.yml, отличие одно: задачи
+# идут на раннер ПК (метка windows), а не на windows-latest / ubuntu-latest - такие метки
+# есть только у раннера ноутбука, и без него задачи висели в очереди и отменялись.
+# Раз папка .gitea/workflows есть, Gitea берёт проверки только отсюда: выпуски и Pages -
+# дело GitHub, здесь их нет. Меняя проверки, править оба файла.
+
+# Проверки на каждый пуш.
+#
+# Раннер windows: программа под Windows, окно на Qt, и часть проверок поднимает
+# настоящее окно на настоящей платформе Qt - offscreen не знает тем Windows и
+# рисует не так. Сеть проверкам не нужна: Hugging Face изображает локальный
+# сервер, которому можно велеть рвать соединение и отдавать не тот размер.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Проверки
+    runs-on: windows
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Зависимости
+        run: pip install -r requirements.txt hypothesis
+
+      - name: Проверки
+        run: python tests.py

@@ -14,6 +14,9 @@
 
 </div>
 
+[![Built with Claude Code](https://img.shields.io/badge/Built_with-Claude_Code-D97757?logo=claude&logoColor=white)](https://claude.com/claude-code)
+Код, тесты и документация этого проекта написаны Claude (Anthropic) в Claude Code. Идеи, проверка и решения - Алексей.
+
 Программа возвращает модели ComfyUI обратно на диск, если ты их удалил, чтобы освободить место. Качает с Hugging Face, с докачкой после обрыва.
 
 Для LM Studio скачивания нет. Там просто показываются точные названия, которые надо вбить в поиск внутри приложения.

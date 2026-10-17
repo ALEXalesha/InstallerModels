@@ -14,6 +14,9 @@
 
 </div>
 
+[![Built with Claude Code](https://img.shields.io/badge/Built_with-Claude_Code-D97757?logo=claude&logoColor=white)](https://claude.com/claude-code)
+Code, tests and docs are written by Claude (Anthropic) in Claude Code. Ideas, testing and decisions - Alexey.
+
 > **The interface is in Russian**, and so is the full manual - [README.ru.md](README.ru.md), which this file summarises. In the screenshot, "Папка ComfyUI" is the ComfyUI folder, "Скачать выбранное" downloads what is ticked, and "не установлено" means "not installed".
 
 ## What it is

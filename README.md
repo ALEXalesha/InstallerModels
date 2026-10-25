@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/icon.png" width="96" alt="">
+
 # InstallerModels
 
 **Puts ComfyUI models back on the disk after you deleted them to free space. Downloads straight from Hugging Face, resumes after a broken connection, checks the size and the sha256 - 15 files, 95.4 GiB, grouped by the workflow that needs them. Your own models are added by pasting a link: the size, the hash and the settings are asked of Hugging Face, not of you.**
